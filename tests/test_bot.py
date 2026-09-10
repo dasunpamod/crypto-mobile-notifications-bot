@@ -273,6 +273,38 @@ class TestAlertEngine(unittest.TestCase):
                 os.unlink(tmp.name)
         _run(go())
 
+    def test_create_one_alert_multi_auto_condition(self):
+        async def go():
+            import database as db
+            from telegram_bot import _create_one_alert
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                # Current price: 76946. Targets: 76000 (below), 75000 (below), 79000 (above)
+                aid1, desc1 = await _create_one_alert("BTCUSDT", 76946.0, "auto", "76000", False, False, False, False, None, None, single_coin_multi=True)
+                aid2, desc2 = await _create_one_alert("BTCUSDT", 76946.0, "auto", "75000", False, False, False, False, None, None, single_coin_multi=True)
+                aid3, desc3 = await _create_one_alert("BTCUSDT", 76946.0, "auto", "79000", False, False, False, False, None, None, single_coin_multi=True)
+
+                self.assertIn("below", desc1)
+                self.assertIn("below", desc2)
+                self.assertIn("above", desc3)
+
+                row1 = await db.get_alert(aid1)
+                row2 = await db.get_alert(aid2)
+                row3 = await db.get_alert(aid3)
+
+                self.assertEqual(row1[3], "below")
+                self.assertEqual(row2[3], "below")
+                self.assertEqual(row3[3], "above")
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
 
 
 class TestNewFeatures(unittest.TestCase):

@@ -294,7 +294,7 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
 
 async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
                             is_move, is_funding, is_persistent, expires_at,
-                            cooldown_sec, window_min=None):
+                            cooldown_sec, window_min=None, single_coin_multi=False):
     """Create a single alert row. Returns (id, description)."""
     if is_trail:
         pct = float(arg.rstrip("%"))
@@ -309,6 +309,8 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
         pct = float(arg.rstrip("%"))
         if not (0 < pct <= 50) or not window_min or not (1 <= window_min <= 1440):
             raise ValueError
+        if condition == "auto":
+            condition = "above"
         aid = await db.add_alert(symbol, current_price, condition, True,
                                  alert_type="move", pct=pct, window_min=window_min,
                                  base_price=current_price, peak_price=current_price,
@@ -318,18 +320,24 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
         pct = float(arg.rstrip("%"))
         if not (0 < abs(pct) <= 5):
             raise ValueError
+        if condition == "auto":
+            condition = "above"
         aid = await db.add_alert(symbol, current_price, condition, True,
                                  alert_type="funding", funding_rate=pct / 100,
                                  expires_at=expires_at, cooldown_sec=cooldown_sec)
         return aid, f"funding {pct:g}%"
     if arg.endswith("%"):
         percent = float(arg.rstrip("%"))
-        if not (0 < percent <= 1000):
+        if not (0 < abs(percent) <= 1000):
             raise ValueError
+        if condition == "auto":
+            condition = "above" if percent > 0 else "below"
+        percent = abs(percent)
         target = current_price * (1 + percent / 100) if condition == "above" else current_price * (1 - percent / 100)
-        if (condition == "above" and current_price >= target) or (
-                condition == "below" and current_price <= target):
-            raise RuntimeError("already-hit")
+        if current_price is not None:
+            if (condition == "above" and current_price >= target) or (
+                    condition == "below" and current_price <= target):
+                raise RuntimeError("already-hit")
         aid = await db.add_alert(symbol, target, condition, is_persistent,
                                  alert_type="price", expires_at=expires_at,
                                  cooldown_sec=cooldown_sec)
@@ -338,9 +346,19 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
     if not (0 < target <= MAX_PRICE_VALUE):
         raise ValueError
     if current_price is not None:
-        if (condition == "above" and current_price >= target) or (
+        if condition == "auto" or single_coin_multi:
+            if target > current_price:
+                condition = "above"
+            elif target < current_price:
+                condition = "below"
+            else:
+                raise RuntimeError("already-hit")
+        elif (condition == "above" and current_price >= target) or (
                 condition == "below" and current_price <= target):
             raise RuntimeError("already-hit")
+    else:
+        if condition == "auto":
+            condition = "above"
     aid = await db.add_alert(symbol, target, condition, is_persistent,
                              alert_type="price", expires_at=expires_at,
                              cooldown_sec=cooldown_sec)
@@ -354,7 +372,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Usage:\n"
         "`/add BTC 72500 above` [repeat] [7d] [cooldown=15m]\n"
         "`/add ETH 5% up repeat`\n"
-        "`/add BTC,ETH 80000,4000 above`\n"
+        "`/add BTC 76000,75000,79000` (auto-detects above/below)\n"
+        "`/add BTC,ETH 80000,4000 above` (ladder)\n"
         "`/add BTC trail 5% below`\n"
         "`/add BTC move 3% 60m`\n"
         "`/add BTC funding 0.01% above`"
@@ -365,13 +384,83 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     args = context.args or []
-    if len(args) < 3:
+    if len(args) < 2:
         await update.message.reply_text(usage, parse_mode="Markdown")
         return
     max_alerts = _max_alerts()
-    raw_coins, price_arg = args[0], args[1]
-    cond_arg = args[2].lower()
-    rest = [a.lower() for a in args[3:]]
+    raw_coins = args[0]
+    kind = args[1].lower()
+    is_trail = kind == "trail"
+    is_move = kind == "move"
+    is_funding = kind == "funding"
+
+    if (is_trail or is_move or is_funding) and len(args) < 3:
+        await update.message.reply_text(usage, parse_mode="Markdown")
+        return
+
+    window_min = None
+    single_coin_multi = False
+
+    if is_trail or is_move or is_funding:
+        price_arg = kind
+        raw_rest = [a.lower() for a in args[2:]]
+        condition = "below" if is_trail else "above"
+        rest = []
+        for token in raw_rest:
+            if token in ("above", "below", "up", "down"):
+                condition = "above" if token in ("above", "up") else "below"
+            else:
+                rest.append(token)
+        if is_move:
+            for token in raw_rest:
+                t = token.rstrip("mM")
+                if t.isdigit():
+                    window_min = int(t)
+                    break
+        coins = parse_symbols(raw_coins)
+        targets_raw = []
+        ladder = False
+    else:
+        # Collect price tokens (handles spaces after commas e.g. ["76000,", "75000,", "79000"])
+        price_tokens = []
+        raw_rest = []
+        in_prices = True
+        for token in args[1:]:
+            clean = token.rstrip(",").replace(",", "").replace(".", "").replace("+", "").replace("-", "")
+            if in_prices:
+                if clean.isdigit() or token.rstrip(",").endswith("%") or token.endswith(","):
+                    price_tokens.append(token)
+                    if not token.endswith(",") and not (len(price_tokens) > 1 and price_tokens[-2].endswith(",")):
+                        in_prices = False
+                else:
+                    in_prices = False
+                    raw_rest.append(token.lower())
+            else:
+                raw_rest.append(token.lower())
+
+        price_arg = "".join(price_tokens) if price_tokens else args[1]
+        condition = "auto"
+        rest = []
+        for token in raw_rest:
+            if token in ("above", "below", "up", "down") and condition == "auto":
+                condition = "above" if token in ("above", "up") else "below"
+            else:
+                rest.append(token)
+
+        coins = parse_symbols(raw_coins)
+        targets_raw = [t.strip() for t in price_arg.split(",") if t.strip()]
+        ladder = len(targets_raw) > 1
+        if ladder and len(coins) == 1 and len(targets_raw) > 1:
+            coins = coins * len(targets_raw)
+            single_coin_multi = True
+        elif ladder and len(coins) != len(targets_raw):
+            await update.message.reply_text("Ladder needs same count: `/add BTC,ETH 80000,4000 above`.", parse_mode="Markdown")
+            return
+
+    if not coins or (not targets_raw and not is_trail and not is_move and not is_funding):
+        await update.message.reply_text(usage, parse_mode="Markdown")
+        return
+
     is_persistent = "repeat" in rest
     expires_at = None
     for token in rest:
@@ -381,6 +470,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if parsed:
             expires_at = parsed
+
     cooldown_sec = None
     for token in rest:
         if token.startswith("cooldown="):
@@ -401,39 +491,15 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 return
     if cooldown_sec and not is_persistent:
         is_persistent = True
-    if cond_arg == "up":
-        cond_arg = "above"
-    elif cond_arg == "down":
-        cond_arg = "below"
-    condition = cond_arg
-    if condition not in ("above", "below"):
-        await update.message.reply_text("Condition must be `above`/`up` or `below`/`down`.", parse_mode="Markdown")
+
+    if len(targets_raw) > 10 or len(coins) > 10:
+        await update.message.reply_text("Max 10 alerts per /add.")
         return
-    coins = parse_symbols(raw_coins)
-    targets_raw = [t.strip() for t in price_arg.split(",") if t.strip()]
-    ladder = len(targets_raw) > 1
-    if not coins or not targets_raw:
-        await update.message.reply_text(usage, parse_mode="Markdown")
-        return
-    if ladder and len(coins) != len(targets_raw):
-        await update.message.reply_text("Ladder needs same count: `/add BTC,ETH 80000,4000 above`.", parse_mode="Markdown")
-        return
-    if len(coins) > 10:
-        await update.message.reply_text("Max 10 coins per /add.")
-        return
-    if await db.count_alerts() + len(coins) > max_alerts:
+    num_new = len(targets_raw) if ladder else len(coins)
+    if await db.count_alerts() + num_new > max_alerts:
         await update.message.reply_text(f"Alert limit reached ({max_alerts}). Remove one first.")
         return
-    kind = price_arg.lower()
-    is_trail = kind == "trail" and len(args) > 3 and args[3].endswith("%")
-    is_move = kind == "move" and len(args) > 4
-    is_funding = kind == "funding"
-    window_min = None
-    if is_move:
-        try:
-            window_min = int(args[4].rstrip("mM"))
-        except ValueError:
-            window_min = None
+
     ws = context.bot_data["ws"]
     engine = context.bot_data["engine"]
     created = []
@@ -451,22 +517,39 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             current_price = engine.last_prices.get(symbol)
         if current_price is not None:
             engine.last_prices[symbol] = current_price
-        arg = targets_raw[i] if ladder else (args[3] if is_trail or is_move or is_funding else price_arg)
+
+        if is_trail or is_move or is_funding:
+            arg = ""
+            for token in args[2:]:
+                if token.endswith("%"):
+                    arg = token
+                    break
+            if not arg and len(args) > 2:
+                arg = args[2]
+        else:
+            arg = targets_raw[i] if ladder else price_arg
+
         try:
             aid, desc = await _create_one_alert(
                 symbol, current_price, condition, arg, is_trail,
                 is_move, is_funding, is_persistent, expires_at,
-                cooldown_sec, window_min)
+                cooldown_sec, window_min, single_coin_multi=single_coin_multi)
+            await ws.subscribe(symbol)
+            created.append((aid, symbol, desc, current_price))
         except RuntimeError:
-            await update.message.reply_text(
-                f"Already true for {_escape_md(symbol.replace('USDT', ''))} "
-                f"(now {format_price(current_price)}).", parse_mode="Markdown")
-            return
+            if not single_coin_multi:
+                await update.message.reply_text(
+                    f"Already true for {_escape_md(symbol.replace('USDT', ''))} "
+                    f"(now {format_price(current_price)}).", parse_mode="Markdown")
+                return
         except ValueError:
             await update.message.reply_text(f"Invalid value `{_escape_md(arg)}`. See /help.", parse_mode="Markdown")
             return
-        await ws.subscribe(symbol)
-        created.append((aid, symbol, desc, current_price))
+
+    if not created:
+        await update.message.reply_text("Target equals the current price — no alerts added.")
+        return
+
     lines = []
     for aid, symbol, desc, now_price in created:
         coin = _escape_md(symbol.replace("USDT", ""))
@@ -658,6 +741,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Alerts:*\n"
         "`/add BTC 72500 above` [repeat] [7d] [cooldown=15m]\n"
         "`/add ETH 5% up repeat`\n"
+        "`/add BTC 76000,75000,79000 above` (multi)\n"
         "`/add BTC,ETH 80000,4000 above` (ladder)\n"
         "`/add BTC trail 5% below` (peak pullback)\n"
         "`/add BTC move 3% 60m` (% in window)\n"
@@ -1296,14 +1380,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if any(label in text for label in menu_labels) or text.startswith("/"):
             context.user_data.pop("awaiting_custom_price", None)  # Cancel wizard
         else:
-            try:
-                target = float(text.replace(",", "").strip())
-            except ValueError:
-                await update.message.reply_text("Please enter a valid number, or tap a menu button to cancel.")
+            # Support single or multiple comma- or space-separated prices
+            raw_parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+            if len(raw_parts) == 1 and " " in raw_parts[0]:
+                raw_parts = raw_parts[0].split()
+
+            targets = []
+            for p in raw_parts:
+                try:
+                    val = float(p.replace(",", "").strip())
+                    if not (0 < val <= MAX_PRICE_VALUE):
+                        await update.message.reply_text(f"Price {p} is out of range. Enter prices like `76000, 75000`.")
+                        return
+                    targets.append(val)
+                except ValueError:
+                    await update.message.reply_text(f"'{p}' is not a valid number. Enter prices like `76000, 75000, 79000`.")
+                    return
+
+            if not targets:
+                await update.message.reply_text("Please enter a valid price, or tap a menu button to cancel.")
                 return
-            if not (0 < target <= MAX_PRICE_VALUE):
-                await update.message.reply_text("That price is out of range. Try again or tap a menu button to cancel.")
-                return
+
             symbol = normalize_symbol(awaiting_coin)
             resolved = await _resolve_symbol(symbol, engine)
             if resolved is None:
@@ -1314,36 +1411,51 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if price is None:
                 price = engine.last_prices.get(symbol)
 
-            if await db.count_alerts() >= _max_alerts():
+            if await db.count_alerts() + len(targets) > _max_alerts():
                 context.user_data.pop("awaiting_custom_price", None)
                 await update.message.reply_text(f"Alert limit reached ({_max_alerts()}). Remove one first with /list.")
                 return
 
-            if price is not None:
-                condition = "above" if target > price else "below"
-                if target == price:
-                    await update.message.reply_text("Target equals the current price — enter a different value.")
-                    return
-            else:
-                condition = "above" if target > 1000 else "below"
-
-            alert_id = await db.add_alert(symbol, target, condition, False)
-
             ws = context.bot_data["ws"]
+            added = []
+            for target in targets:
+                if price is not None:
+                    condition = "above" if target > price else "below"
+                    if target == price:
+                        continue
+                else:
+                    condition = "above" if target > 1000 else "below"
+
+                alert_id = await db.add_alert(symbol, target, condition, False)
+                added.append((alert_id, target, condition))
+
             await ws.subscribe(symbol)
             context.user_data.pop("awaiting_custom_price", None)
             coin = _escape_md(awaiting_coin)
-            if price is not None:
-                await update.message.reply_text(
-                    f"✅ Alert #{alert_id} added: *{coin}* {condition} *{format_price(target)}* "
-                    f"(now {format_price(price)}).",
-                    parse_mode="Markdown",
-                )
+
+            if not added:
+                await update.message.reply_text("Target equals the current price — no alert added.")
+                return
+
+            if len(added) == 1:
+                aid, target, condition = added[0]
+                if price is not None:
+                    await update.message.reply_text(
+                        f"✅ Alert #{aid} added: *{coin}* {condition} *{format_price(target)}* "
+                        f"(now {format_price(price)}).",
+                        parse_mode="Markdown",
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"✅ Alert #{aid} added: *{coin}* {condition} *{format_price(target)}*.",
+                        parse_mode="Markdown",
+                    )
             else:
-                await update.message.reply_text(
-                    f"✅ Alert #{alert_id} added: *{coin}* {condition} *{format_price(target)}*.",
-                    parse_mode="Markdown",
-                )
+                now_str = f" (now {format_price(price)})" if price is not None else ""
+                lines = [f"✅ Added *{len(added)}* alerts for *{coin}*{now_str}:"]
+                for aid, target, condition in added:
+                    lines.append(f"  • #{aid} {condition} *{format_price(target)}*")
+                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
             return
 
     # Normal Main Menu
@@ -1556,7 +1668,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = [
             [InlineKeyboardButton("5% Pump (Repeat)", callback_data=f"addwiz_type_{coin}_5pump")],
             [InlineKeyboardButton("5% Drop (Repeat)", callback_data=f"addwiz_type_{coin}_5drop")],
-            [InlineKeyboardButton("Custom Price", callback_data=f"addwiz_type_{coin}_custom")]
+            [InlineKeyboardButton("Custom Price(s)", callback_data=f"addwiz_type_{coin}_custom")]
         ]
         try:
             await query.edit_message_text(
@@ -1616,7 +1728,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             coin_safe = _escape_md(coin)
             try:
                 await query.edit_message_text(
-                    f"Send the exact target price for *{coin_safe}* (e.g. `70000`).",
+                    f"Send target price(s) for *{coin_safe}*:\n\n"
+                    f"• Single price: `70000`\n"
+                    f"• Multiple prices: `76000, 75000, 79000`\n\n"
+                    f"_Prices are automatically set to above/below based on market price._",
                     parse_mode="Markdown"
                 )
             except Exception:
