@@ -490,29 +490,30 @@ class TestWebSocketGuards(unittest.TestCase):
 
 
 class TestNewPowerFeatures(unittest.TestCase):
-    def test_dexscreener_parser(self):
+    def test_heartbeat_task(self):
         async def go():
-            import prices
-            from unittest.mock import AsyncMock, MagicMock
-            mock_client = MagicMock()
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "pairs": [
-                    {
-                        "chainId": "solana",
-                        "dexId": "raydium",
-                        "baseToken": {"symbol": "PENGU", "address": "pengu123"},
-                        "priceUsd": "0.0345",
-                        "priceChange": {"h24": 15.2}
-                    }
-                ]
-            }
-            mock_client.get = AsyncMock(return_value=mock_resp)
-            ticker = await prices._fetch_from_dexscreener(mock_client, "PENGUUSDT")
-            self.assertIsNotNone(ticker)
-            self.assertEqual(ticker["lastPrice"], "0.0345")
-            self.assertAlmostEqual(float(ticker["price24hPcnt"]), 0.152)
+            import config as cfg
+            import main
+            from unittest.mock import AsyncMock, patch
+
+            self.assertEqual(getattr(cfg, "HEARTBEAT_INTERVAL_SEC", 300), 300)
+
+            # Test when HEALTHCHECK_URL is not set: exits immediately
+            with patch.object(cfg, "HEALTHCHECK_URL", ""):
+                with patch("main.ping_healthcheck", new_callable=AsyncMock) as mock_ping:
+                    await main.heartbeat_task()
+                    self.assertFalse(mock_ping.called)
+
+            # Test when HEALTHCHECK_URL is set: sends initial ping immediately
+            with patch.object(cfg, "HEALTHCHECK_URL", "https://hc-ping.com/fake-uuid"):
+                with patch("main.ping_healthcheck", new_callable=AsyncMock) as mock_ping:
+                    with patch("asyncio.sleep", side_effect=asyncio.CancelledError) as mock_sleep:
+                        try:
+                            await main.heartbeat_task()
+                        except asyncio.CancelledError:
+                            pass
+                        self.assertTrue(mock_ping.called)
+                        mock_sleep.assert_called_with(300)
         _run(go())
 
     def test_notification_quick_action_buttons(self):

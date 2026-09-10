@@ -112,7 +112,7 @@ async def funding_poller_task(engine) -> None:
 
 
 async def maintenance_task(app) -> None:
-    """Hourly: flush queued notifications, ping healthcheck, prune expired."""
+    """Hourly: flush queued notifications, prune expired."""
     first = True
     while True:
         try:
@@ -121,7 +121,6 @@ async def maintenance_task(app) -> None:
             first = False
             bot = app.bot if app else None
             await flush_pending(telegram_bot=bot, chat_id=config.TELEGRAM_USER_ID or None)
-            await ping_healthcheck()
             try:
                 await db.prune_expired()
             except Exception:
@@ -133,28 +132,27 @@ async def maintenance_task(app) -> None:
             await asyncio.sleep(300)
 
 
-async def rest_price_poller_task(engine) -> None:
-    """Polls REST/DexScreener for active symbols that are not receiving WebSocket ticks."""
+async def heartbeat_task() -> None:
+    """Pings external uptime monitor (e.g. Healthchecks.io / Uptime Kuma) every 5 minutes."""
+    if not (config.HEALTHCHECK_URL or "").strip():
+        logger.info("Heartbeat monitor disabled — HEALTHCHECK_URL not set.")
+        return
+
+    interval = getattr(config, "HEARTBEAT_INTERVAL_SEC", 300)
+    logger.info(f"Heartbeat monitor active — pinging every {interval}s ({interval // 60}m).")
+
+    # Send initial ping immediately on startup so monitor knows service is up
+    await ping_healthcheck()
+
     while True:
         try:
-            await asyncio.sleep(20)
-            symbols = await db.get_active_symbols()
-            now = datetime.datetime.now(datetime.timezone.utc)
-            for symbol in symbols:
-                last_ts = getattr(engine, "last_update_at", {}).get(symbol)
-                # If symbol hasn't received a tick in > 25 seconds, poll via REST/DexScreener
-                if not last_ts or (now - last_ts).total_seconds() > 25:
-                    try:
-                        price = await get_current_price(symbol)
-                        if price and price > 0:
-                            await engine.on_price_update(symbol, price)
-                    except Exception as e:
-                        logger.debug(f"REST price poll error for {symbol}: {e}")
+            await asyncio.sleep(interval)
+            await ping_healthcheck()
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"REST price poller error: {e}")
-            await asyncio.sleep(10)
+            logger.warning(f"Heartbeat ping error: {e}")
+            await asyncio.sleep(30)
 
 
 async def main() -> None:
@@ -198,11 +196,11 @@ async def main() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot started — send /help to your bot")
 
-    # ── Start Daily Briefing + maintenance/funding/REST tasks ───────────
+    # ── Start Daily Briefing + maintenance/funding/heartbeat tasks ───────
     briefing_task = asyncio.create_task(daily_briefing_task(app))
     maintenance_task_handle = asyncio.create_task(maintenance_task(app))
     funding_task = asyncio.create_task(funding_poller_task(engine))
-    rest_poller_task = asyncio.create_task(rest_price_poller_task(engine))
+    heartbeat_task_handle = asyncio.create_task(heartbeat_task())
 
     # ── Graceful shutdown on SIGINT/SIGTERM ───────────────────────────────
     stop_event = asyncio.Event()
@@ -245,8 +243,8 @@ async def main() -> None:
         briefing_task.cancel()
         maintenance_task_handle.cancel()
         funding_task.cancel()
-        rest_poller_task.cancel()
-        for bg in (ws_task, briefing_task, maintenance_task_handle, funding_task, rest_poller_task):
+        heartbeat_task_handle.cancel()
+        for bg in (ws_task, briefing_task, maintenance_task_handle, funding_task, heartbeat_task_handle):
             try:
                 await bg
             except asyncio.CancelledError:

@@ -172,6 +172,7 @@ WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "").strip()
 
 # Healthcheck ping URL (Uptime Kuma / healthchecks.io). Empty = off.
 HEALTHCHECK_URL: str = os.getenv("HEALTHCHECK_URL", "").strip()
+HEARTBEAT_INTERVAL_SEC: int = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "300"))  # 5 minutes (300s)
 
 # ntfy auth for private servers (token preferred, else user/password).
 NTFY_USER: str = os.getenv("NTFY_USER", "").strip().strip("'\"")
