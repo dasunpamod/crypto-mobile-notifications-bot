@@ -200,12 +200,11 @@ __all__ = ["format_price", "get_current_price", "create_bot"]
 
 def get_main_keyboard(engine):
     """Create the persistent main menu keyboard."""
-    pause_btn = "▶️ Resume Alerts" if engine.is_muted() else "⏸️ Pause Alerts"
+    pause_btn = "▶️ Resume" if engine.is_muted() else "⏸️ Pause"
     keyboard = [
-        [KeyboardButton("📋 List Alerts"), KeyboardButton("💰 Check Price")],
-        [KeyboardButton("➕ Add Alert"), KeyboardButton("❌ Remove Alert")],
-        [KeyboardButton(pause_btn), KeyboardButton("❓ Help")],
-        [KeyboardButton("Prices: All"), KeyboardButton("Movers"), KeyboardButton("History")]
+        [KeyboardButton("📋 My Alerts"), KeyboardButton("💰 Prices")],
+        [KeyboardButton("➕ Add Alert"), KeyboardButton("📊 Movers")],
+        [KeyboardButton(pause_btn), KeyboardButton("📜 History")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -1291,8 +1290,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # State machine for Custom Price Wizard
     awaiting_coin = context.user_data.get("awaiting_custom_price")
     if awaiting_coin:
-        menu_labels = ("List Alerts", "Check Price", "Add Alert", "Remove Alert",
-                       "Pause Alerts", "Resume Alerts", "Help")
+        menu_labels = ("My Alerts", "List Alerts", "Prices", "Check Price", "Add Alert",
+                       "Remove Alert", "Pause", "Resume", "Pause Alerts", "Resume Alerts",
+                       "Help", "Movers", "History")
         if any(label in text for label in menu_labels) or text.startswith("/"):
             context.user_data.pop("awaiting_custom_price", None)  # Cancel wizard
         else:
@@ -1347,7 +1347,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     # Normal Main Menu
-    if text in ("📋 List Alerts", "List Alerts"):
+    if text in ("📋 My Alerts", "📋 List Alerts", "My Alerts", "List Alerts"):
         await cmd_list(update, context)
     elif text in ("❓ Help", "Help"):
         await cmd_help(update, context)
@@ -1357,22 +1357,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             [InlineKeyboardButton("SOL", callback_data="addwiz_coin_SOL"), InlineKeyboardButton("HYPE", callback_data="addwiz_coin_HYPE")]
         ]
         await update.message.reply_text("Select a coin to set an alert for:", reply_markup=InlineKeyboardMarkup(kb))
-    elif text in ("💰 Check Price", "Check Price", "Prices: All"):
+    elif text in ("💰 Prices", "💰 Check Price", "Check Price", "Prices: All", "Prices"):
         await _send_all_prices(update.message, engine)
-    elif text in ("❌ Remove Alert", "Remove Alert"):
-        await update.message.reply_text("Tap *List Alerts* to see inline delete buttons for all your alerts!", parse_mode="Markdown")
-    elif text in ("⏸️ Pause Alerts", "Pause Alerts"):
+    elif text in ("⏸️ Pause", "⏸️ Pause Alerts", "Pause Alerts", "Pause"):
         engine.pause_alerts(config.PAUSE_DURATION_HOURS)
         await update.message.reply_text(f"Alerts paused for {config.PAUSE_DURATION_HOURS} hour(s).", reply_markup=get_main_keyboard(engine))
-    elif text in ("▶️ Resume Alerts", "Resume Alerts"):
+    elif text in ("▶️ Resume", "▶️ Resume Alerts", "Resume Alerts", "Resume"):
         engine.resume_alerts()
         await update.message.reply_text("Alerts resumed.", reply_markup=get_main_keyboard(engine))
-    elif text in ("Movers", "Top Movers"):
+    elif text in ("📊 Movers", "Movers", "Top Movers"):
         await cmd_movers(update, context)
-    elif text in ("History",):
+    elif text in ("📜 History", "History"):
         await cmd_history(update, context)
     elif text in ("Watchlist",):
         await cmd_watchlist(update, context)
+    elif text in ("❌ Remove Alert", "Remove Alert"):
+        await update.message.reply_text("Tap *My Alerts* to see inline delete buttons for each alert.", parse_mode="Markdown")
     elif text and not text.startswith("/"):
         # Unknown free text outside the wizard — guide back to the menu.
         await update.message.reply_text("Use the menu buttons below, or /help for commands.", reply_markup=get_main_keyboard(engine))
