@@ -8,6 +8,7 @@ import database as db
 import config
 from config import PERSISTENT_ALERT_COOLDOWN_SEC
 from notifier import send_alert_notification
+import prices
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,7 @@ class AlertEngine:
             if not (price > 0 and price == price and price != float("inf")):
                 return
             symbol = symbol.upper()
+            prices.register_live_price(symbol, price)
             now = datetime.datetime.now(datetime.timezone.utc)
 
             if self.is_muted():

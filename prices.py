@@ -1,9 +1,11 @@
-"""Shared price fetching via Bybit REST API.
+﻿"""Shared price fetching via Bybit REST API with multi-exchange fallbacks.
 
 Single source of truth for "current price" lookups used by the Telegram bot
 (commands, wizards, daily briefing) and for validating that a symbol exists.
-A shared httpx client + short TTL cache keeps this fast and avoids hammering
-the API when the briefing or list view fetches several coins at once.
+A shared httpx client + short TTL cache keeps this fast.
+
+If Bybit REST is geo-blocked (e.g., HTTP 403 on US cloud VMs), it seamlessly
+falls back to Binance.US, Gate.io, and live WebSocket price caches.
 """
 
 import asyncio
@@ -35,7 +37,15 @@ async def _get_client() -> httpx.AsyncClient:
     if _client is None:
         async with _client_lock:
             if _client is None:
-                _client = httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0))
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                }
+                _client = httpx.AsyncClient(
+                    headers=headers,
+                    timeout=httpx.Timeout(8.0, connect=5.0),
+                    follow_redirects=True,
+                )
     return _client
 
 
@@ -50,8 +60,84 @@ async def close_price_client() -> None:
         _client = None
 
 
+def register_live_price(symbol: str, price: float) -> None:
+    """Seed or update cache from live WebSocket ticks (never geo-blocked)."""
+    symbol = (symbol or "").strip().upper()
+    if not symbol or not (price > 0):
+        return
+    now = time.monotonic()
+    existing = _cache.get(symbol)
+    pct = existing[0].get("price24hPcnt") if existing else None
+    ticker = {
+        "symbol": symbol,
+        "lastPrice": str(price),
+        "price24hPcnt": pct,
+    }
+    _cache[symbol] = (ticker, now)
+
+
+async def _fetch_from_bybit(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    try:
+        resp = await client.get(
+            _BYBIT_TICKERS_URL, params={"category": "linear", "symbol": symbol}
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            items = (data.get("result") or {}).get("list") or []
+            if items and isinstance(items[0], dict):
+                return dict(items[0])
+        elif resp.status_code == 403:
+            logger.debug(f"Bybit 403 for {symbol} (geo-restricted); falling back to secondary APIs")
+    except Exception as e:
+        logger.debug(f"Bybit ticker error for {symbol}: {e}")
+    return None
+
+
+async def _fetch_from_binance_us(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    try:
+        resp = await client.get(
+            f"https://api.binance.us/api/v3/ticker/24hr?symbol={symbol}"
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            price = float(data.get("lastPrice") or 0)
+            pct = float(data.get("priceChangePercent") or 0) / 100.0
+            if price > 0:
+                return {
+                    "symbol": symbol,
+                    "lastPrice": str(price),
+                    "price24hPcnt": str(pct),
+                }
+    except Exception as e:
+        logger.debug(f"Binance.US ticker error for {symbol}: {e}")
+    return None
+
+
+async def _fetch_from_gateio(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    try:
+        pair = symbol.replace("USDT", "_USDT") if "USDT" in symbol else f"{symbol}_USDT"
+        resp = await client.get(
+            f"https://api.gateio.ws/api/v4/spot/tickers?currency_pair={pair}"
+        )
+        if resp.status_code == 200:
+            items = resp.json()
+            if items and isinstance(items, list):
+                item = items[0]
+                price = float(item.get("last") or 0)
+                pct = float(item.get("change_percentage") or 0) / 100.0
+                if price > 0:
+                    return {
+                        "symbol": symbol,
+                        "lastPrice": str(price),
+                        "price24hPcnt": str(pct),
+                    }
+    except Exception as e:
+        logger.debug(f"Gate.io ticker error for {symbol}: {e}")
+    return None
+
+
 async def get_ticker(symbol: str):
-    """Fetch the full Bybit ticker dict for a symbol (cached). None if unknown."""
+    """Fetch ticker dict for a symbol (cached). Falls back to Binance.US/Gate.io if Bybit is geo-blocked."""
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return None
@@ -60,24 +146,25 @@ async def get_ticker(symbol: str):
     entry = _cache.get(symbol)
     if entry and (now - entry[1]) < ttl:
         return entry[0]
-    try:
-        client = await _get_client()
-        resp = await client.get(
-            _BYBIT_TICKERS_URL, params={"category": "linear", "symbol": symbol}
-        )
-        if resp.status_code != 200:
-            logger.warning(f"Bybit tickers HTTP {resp.status_code} for {symbol}")
-            return entry[0] if entry else None
-        data = resp.json()
-        items = (data.get("result") or {}).get("list") or []
-        if not items or not isinstance(items[0], dict):
-            return None  # unknown symbol
-        ticker = dict(items[0])
+
+    client = await _get_client()
+
+    # 1. Try Bybit Linear
+    ticker = await _fetch_from_bybit(client, symbol)
+
+    # 2. Fallback to Binance.US (works on US servers)
+    if not ticker:
+        ticker = await _fetch_from_binance_us(client, symbol)
+
+    # 3. Fallback to Gate.io (for coins not on Binance.US)
+    if not ticker:
+        ticker = await _fetch_from_gateio(client, symbol)
+
+    if ticker:
         _cache[symbol] = (ticker, now)
         return ticker
-    except Exception as e:
-        logger.warning(f"Failed to fetch ticker for {symbol}: {e}")
-        return entry[0] if entry else None
+
+    return entry[0] if entry else None
 
 
 def cached_ticker(symbol: str):
@@ -118,14 +205,14 @@ def cached_price(symbol: str) -> float | None:
 async def get_current_price(symbol: str) -> float | None:
     """Fetch the current last price for a symbol (e.g. 'BTCUSDT').
 
-    Returns None when the symbol is unknown or the request fails.
+    Returns None when the symbol is unknown or all requests fail.
     Results are cached for a few seconds.
     """
     return ticker_price(await get_ticker(symbol))
 
 
 async def symbol_exists(symbol: str) -> bool:
-    """Check whether a symbol is tradeable on Bybit (cached)."""
+    """Check whether a symbol is tradeable (cached)."""
     return await get_current_price(symbol) is not None
 
 
@@ -149,26 +236,52 @@ async def get_tickers(symbols) -> dict:
 
 async def get_top_movers(limit: int = 10) -> list:
     """Return top linear tickers by absolute 24h change: [(symbol, price, pct)]."""
+    client = await _get_client()
+
+    # 1. Try Bybit
     try:
-        client = await _get_client()
         resp = await client.get(_BYBIT_TICKERS_URL, params={"category": "linear"})
-        if resp.status_code != 200:
-            return []
-        items = (resp.json().get("result") or {}).get("list") or []
-        rows = []
-        for item in items:
-            try:
-                symbol = str(item.get("symbol") or "").upper()
-                if not symbol.endswith("USDT"):
+        if resp.status_code == 200:
+            items = (resp.json().get("result") or {}).get("list") or []
+            rows = []
+            for item in items:
+                try:
+                    symbol = str(item.get("symbol") or "").upper()
+                    if not symbol.endswith("USDT"):
+                        continue
+                    price = float(item.get("lastPrice") or 0)
+                    pct = float(item.get("price24hPcnt") or 0)
+                except (TypeError, ValueError):
                     continue
-                price = float(item.get("lastPrice") or 0)
-                pct = float(item.get("price24hPcnt") or 0)
-            except (TypeError, ValueError):
-                continue
-            if price > 0:
-                rows.append((symbol, price, pct))
-        rows.sort(key=lambda r: abs(r[2]), reverse=True)
-        return rows[: max(1, min(limit, 25))]
+                if price > 0:
+                    rows.append((symbol, price, pct))
+            if rows:
+                rows.sort(key=lambda r: abs(r[2]), reverse=True)
+                return rows[: max(1, min(limit, 25))]
     except Exception as e:
-        logger.warning(f"Failed to fetch top movers: {e}")
-        return []
+        logger.debug(f"Bybit top movers error: {e}")
+
+    # 2. Fallback to Binance.US
+    try:
+        resp = await client.get("https://api.binance.us/api/v3/ticker/24hr")
+        if resp.status_code == 200:
+            items = resp.json()
+            rows = []
+            for item in items:
+                try:
+                    symbol = str(item.get("symbol") or "").upper()
+                    if not symbol.endswith("USDT"):
+                        continue
+                    price = float(item.get("lastPrice") or 0)
+                    pct = float(item.get("priceChangePercent") or 0) / 100.0
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    rows.append((symbol, price, pct))
+            if rows:
+                rows.sort(key=lambda r: abs(r[2]), reverse=True)
+                return rows[: max(1, min(limit, 25))]
+    except Exception as e:
+        logger.debug(f"Binance.US top movers error: {e}")
+
+    return []

@@ -196,14 +196,14 @@ def format_price(price: float) -> str:
         return f"${price:,.2f}"
 
 
-async def _resolve_symbol(coin_or_symbol: str) -> tuple | None:
-    """Normalize + verify a symbol against Bybit. Returns (symbol, price) or None."""
+async def _resolve_symbol(coin_or_symbol: str, engine=None) -> tuple | None:
+    """Normalize + verify a symbol. Returns (symbol, price)."""
     symbol = normalize_symbol(coin_or_symbol)
     if not is_valid_symbol(symbol):
         return None
     price = await get_current_price(symbol)
-    if price is None:
-        return None
+    if price is None and engine is not None:
+        price = engine.last_prices.get(symbol)
     return symbol, price
 
 
@@ -354,9 +354,10 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
     target = float(arg.replace(",", ""))
     if not (0 < target <= MAX_PRICE_VALUE):
         raise ValueError
-    if (condition == "above" and current_price >= target) or (
-            condition == "below" and current_price <= target):
-        raise RuntimeError("already-hit")
+    if current_price is not None:
+        if (condition == "above" and current_price >= target) or (
+                condition == "below" and current_price <= target):
+            raise RuntimeError("already-hit")
     aid = await db.add_alert(symbol, target, condition, is_persistent,
                              alert_type="price", expires_at=expires_at,
                              cooldown_sec=cooldown_sec)
@@ -458,12 +459,15 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not is_valid_symbol(symbol):
             await update.message.reply_text(f"Invalid symbol `{_escape_md(raw_coin)}`.", parse_mode="Markdown")
             return
-        resolved = await _resolve_symbol(symbol)
+        resolved = await _resolve_symbol(symbol, engine)
         if resolved is None:
-            await update.message.reply_text(f"Unknown symbol `{_escape_md(symbol)}` — not on Bybit.", parse_mode="Markdown")
+            await update.message.reply_text(f"Invalid symbol `{_escape_md(symbol)}`.", parse_mode="Markdown")
             return
         symbol, current_price = resolved
-        engine.last_prices[symbol] = current_price
+        if current_price is None:
+            current_price = engine.last_prices.get(symbol)
+        if current_price is not None:
+            engine.last_prices[symbol] = current_price
         arg = targets_raw[i] if ladder else (args[3] if is_trail or is_move or is_funding else price_arg)
         try:
             aid, desc = await _create_one_alert(
@@ -1317,31 +1321,45 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text("That price is out of range. Try again or tap a menu button to cancel.")
                 return
             symbol = normalize_symbol(awaiting_coin)
-            resolved = await _resolve_symbol(symbol)
+            resolved = await _resolve_symbol(symbol, engine)
             if resolved is None:
                 context.user_data.pop("awaiting_custom_price", None)
-                await update.message.reply_text(f"Could not verify {awaiting_coin} on Bybit. Wizard cancelled.")
+                await update.message.reply_text(f"Invalid coin `{_escape_md(awaiting_coin)}`. Wizard cancelled.", parse_mode="Markdown")
                 return
             symbol, price = resolved
+            if price is None:
+                price = engine.last_prices.get(symbol)
+
             if await db.count_alerts() >= _max_alerts():
                 context.user_data.pop("awaiting_custom_price", None)
                 await update.message.reply_text(f"Alert limit reached ({_max_alerts()}). Remove one first with /list.")
                 return
-            condition = "above" if target > price else "below"
-            if target == price:
-                await update.message.reply_text("Target equals the current price — enter a different value.")
-                return
+
+            if price is not None:
+                condition = "above" if target > price else "below"
+                if target == price:
+                    await update.message.reply_text("Target equals the current price — enter a different value.")
+                    return
+            else:
+                condition = "above" if target > 1000 else "below"
+
             alert_id = await db.add_alert(symbol, target, condition, False)
 
             ws = context.bot_data["ws"]
             await ws.subscribe(symbol)
             context.user_data.pop("awaiting_custom_price", None)
             coin = _escape_md(awaiting_coin)
-            await update.message.reply_text(
-                f"Alert #{alert_id} added: *{coin}* {condition} *{format_price(target)}* "
-                f"(now {format_price(price)}).",
-                parse_mode="Markdown",
-            )
+            if price is not None:
+                await update.message.reply_text(
+                    f"✅ Alert #{alert_id} added: *{coin}* {condition} *{format_price(target)}* "
+                    f"(now {format_price(price)}).",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ Alert #{alert_id} added: *{coin}* {condition} *{format_price(target)}*.",
+                    parse_mode="Markdown",
+                )
             return
 
     # Normal Main Menu
@@ -1586,6 +1604,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     pass
                 return
             price = await get_current_price(symbol)
+            if not price:
+                price = engine.last_prices.get(symbol)
             if not price:
                 try:
                     await query.edit_message_text("Could not fetch current price to calculate percentage.")
