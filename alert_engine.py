@@ -8,7 +8,7 @@ import database as db
 import config
 from config import PERSISTENT_ALERT_COOLDOWN_SEC
 from notifier import send_alert_notification
-import prices
+from prices import format_price, register_live_price
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ class AlertEngine:
         tag = " [REPEAT]" if is_persistent else ""
         logger.info(
             f"Alert #{alert_id}{tag} [{alert_type}] triggered: {symbol} "
-            f"{condition} ${target:,.2f} (current: ${price:,.2f}) {detail}".rstrip()
+            f"{condition} {format_price(target)} (current: {format_price(price)}) {detail}".rstrip()
         )
         await send_alert_notification(
             symbol=symbol, condition=condition, target=target,
@@ -184,7 +184,7 @@ class AlertEngine:
             if not (price > 0 and price == price and price != float("inf")):
                 return
             symbol = symbol.upper()
-            prices.register_live_price(symbol, price)
+            register_live_price(symbol, price)
             now = datetime.datetime.now(datetime.timezone.utc)
 
             if self.is_muted():
@@ -257,7 +257,7 @@ class AlertEngine:
                                 condition == "below" and move <= -pct
                             ):
                                 triggered_any = True
-                                await self._fire(alert, price, f"{move:+.2f}% from {base:,.2f}")
+                                await self._fire(alert, price, f"{move:+.2f}% from {format_price(base)}")
                         elif alert_type == "trail":
                             pct = db.alert_field(alert, "pct") or 0
                             peak = db.alert_field(alert, "peak_price") or price
@@ -271,15 +271,16 @@ class AlertEngine:
                                 drop = (peak - price) / peak * 100
                                 if drop >= pct:
                                     triggered_any = True
-                                    await self._fire(alert, price, f"{drop:.2f}% below peak {peak:,.2f}")
+                                    await self._fire(alert, price, f"{drop:.2f}% below peak {format_price(peak)}")
                         elif alert_type == "move":
                             pct = db.alert_field(alert, "pct") or 0
                             base = db.alert_field(alert, "base_price") or 0
                             window_min = db.alert_field(alert, "window_min") or 0
-                            created = _parse_utc_timestamp(db.alert_field(alert, "created_at"))
+                            anchor_ts = db.alert_field(alert, "last_triggered_at") or db.alert_field(alert, "created_at")
+                            anchor = _parse_utc_timestamp(anchor_ts)
                             if not (pct and base and window_min):
                                 continue
-                            if created and (now - created).total_seconds() > window_min * 60:
+                            if anchor and (now - anchor).total_seconds() > window_min * 60:
                                 # Window elapsed without triggering — re-anchor.
                                 try:
                                     await db.rebase_alert(alert_id, price)

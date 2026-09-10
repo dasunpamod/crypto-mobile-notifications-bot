@@ -1,4 +1,4 @@
-﻿# Crypto Mobile Notifications & Telegram Alert Bot
+# Crypto Mobile Notifications & Telegram Alert Bot
 
 A high-speed, real-time cryptocurrency alert system that delivers **instant, loud mobile push notifications directly to your phone via [ntfy](https://ntfy.sh)**, managed seamlessly through an interactive **Telegram Bot**. Powered by Bybit v5 WebSockets for sub-second price reaction.
 

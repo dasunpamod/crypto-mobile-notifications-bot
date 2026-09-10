@@ -30,8 +30,12 @@ class TestSymbolNormalization(unittest.TestCase):
     def test_format_price(self):
         from telegram_bot import format_price
         self.assertEqual(format_price(70000), "$70,000.00")
+        self.assertEqual(format_price(2.5), "$2.50")
         self.assertEqual(format_price(0.5), "$0.5000")
+        self.assertEqual(format_price(0.1234), "$0.1234")
         self.assertEqual(format_price(0.0001234), "$0.000123")
+        self.assertEqual(format_price(0.00004567), "$0.000046")
+        self.assertEqual(format_price(0.00000123), "$0.00000123")
         self.assertEqual(format_price(-5), "N/A")
         self.assertEqual(format_price(float("nan")), "N/A")
         self.assertEqual(format_price("junk"), "N/A")
@@ -62,6 +66,23 @@ class TestDatabase(unittest.TestCase):
                     await db.add_alert("BTCUSDT", -1, "above")
                 with self.assertRaises(ValueError):
                     await db.add_alert("BTCUSDT", 100, "sideways")
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_checkpoint_wal(self):
+        async def go():
+            import database as db
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                await db.add_alert("BTCUSDT", 70000, "above")
+                await db.checkpoint_wal()
             finally:
                 await db.close_db()
                 db.DB_PATH, db._db = old_path, old_conn
@@ -160,6 +181,98 @@ class TestAlertEngine(unittest.TestCase):
                 db.DB_PATH, db._db = old_path, old_conn
                 os.unlink(tmp.name)
         _run(go())
+
+    def test_move_alert_fires_on_rapid_move(self):
+        async def go():
+            import database as db
+            from alert_engine import AlertEngine
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                engine = AlertEngine()
+                sent = []
+
+                async def fake_notify(**kwargs):
+                    sent.append(kwargs)
+
+                import alert_engine as ae
+                old_notify = ae.send_alert_notification
+                ae.send_alert_notification = fake_notify
+                try:
+                    await db.add_alert("BTCUSDT", 100, "above", True,
+                                       alert_type="move", pct=5.0, window_min=5,
+                                       base_price=100.0, peak_price=100.0)
+                    # +2% move within window -> no fire
+                    await engine.on_price_update("BTCUSDT", 102.0)
+                    self.assertEqual(len(sent), 0)
+                    # +6% move within window -> fire!
+                    await engine.on_price_update("BTCUSDT", 106.0)
+                    self.assertEqual(len(sent), 1)
+                    self.assertIn("+6.00% in 5m", sent[0].get("detail", ""))
+                finally:
+                    ae.send_alert_notification = old_notify
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_move_alert_reanchors_on_window_expiry(self):
+        async def go():
+            import database as db
+            from alert_engine import AlertEngine
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                engine = AlertEngine()
+                sent = []
+
+                async def fake_notify(**kwargs):
+                    sent.append(kwargs)
+
+                import alert_engine as ae
+                import datetime as _dt
+                old_notify = ae.send_alert_notification
+                ae.send_alert_notification = fake_notify
+                try:
+                    aid = await db.add_alert("BTCUSDT", 100, "above", True,
+                                             alert_type="move", pct=5.0, window_min=5,
+                                             base_price=100.0, peak_price=100.0)
+                    # Simulate alert created 10 minutes ago
+                    ten_min_ago = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(minutes=10)).isoformat()
+                    conn = await db.get_db()
+                    await conn.execute("UPDATE alerts SET created_at = ? WHERE id = ?", (ten_min_ago, aid))
+                    await conn.commit()
+
+                    # Price ticks to 102.0 (+2%, under 5% threshold).
+                    # Window expired -> re-anchors base_price to 102.0 and sets last_triggered_at to now.
+                    await engine.on_price_update("BTCUSDT", 102.0)
+                    self.assertEqual(len(sent), 0)
+
+                    row = await db.get_alert(aid)
+                    # base_price (index 13) should now be 102.0
+                    self.assertEqual(row[13], 102.0)
+                    self.assertIsNotNone(row[6])  # last_triggered_at updated
+
+                    # Next tick to 102.5 (+0.49%) right after -> window is fresh!
+                    # Should NOT rebase again!
+                    await engine.on_price_update("BTCUSDT", 102.5)
+                    row2 = await db.get_alert(aid)
+                    self.assertEqual(row2[13], 102.0)  # still 102.0, not rebased on every tick!
+                finally:
+                    ae.send_alert_notification = old_notify
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
 
 
 class TestNewFeatures(unittest.TestCase):
@@ -320,6 +433,15 @@ class TestPricesCache(unittest.TestCase):
         self.assertIsNotNone(ticker)
         self.assertEqual(prices.ticker_price(ticker), 9.99)
         self.assertIsNone(prices.cached_ticker("NOPEUSDT"))
+
+    def test_prune_cache(self):
+        import prices
+        # Fill cache with 550 dummy entries
+        for i in range(550):
+            prices._cache[f"COIN{i}USDT"] = ({"lastPrice": str(i)}, 1.0)
+        self.assertGreater(len(prices._cache), 500)
+        prices._prune_cache()
+        self.assertLessEqual(len(prices._cache), 500)
 
 
 class TestWebSocketGuards(unittest.TestCase):

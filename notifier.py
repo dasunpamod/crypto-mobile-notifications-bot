@@ -7,6 +7,7 @@ import httpx
 import config
 from config import NTFY_SERVER, NTFY_TOPIC, SEND_TELEGRAM_ALERTS
 import database as db
+from prices import format_price
 
 logger = logging.getLogger(__name__)
 
@@ -160,10 +161,13 @@ async def send_alert_notification(
     emoji = "\U0001f4c8" if condition == "above" else "\U0001f4c9"
     tag = "chart_with_upwards_trend" if condition == "above" else "chart_with_downwards_trend"
 
+    target_str = format_price(target)
+    curr_str = format_price(current_price)
+
     title = f"{emoji} {coin} Alert Triggered"
     message = (
-        f"{coin} crossed {direction} ${target:,.2f}\n"
-        f"Current price: ${current_price:,.2f}"
+        f"{coin} crossed {direction} {target_str}\n"
+        f"Current price: {curr_str}"
     )
     if detail:
         message += f"\n{detail}"
@@ -185,16 +189,20 @@ async def send_alert_notification(
     except Exception:
         pass
 
+    detail_line = f"\n{_escape_markdown(detail)}" if detail else ""
+    telegram_text = (
+        f"{emoji} *{coin_safe} Alert Triggered*\n\n"
+        f"{coin_safe} crossed {direction} `{target_str}`\n"
+        f"Current price: `{curr_str}`"
+        f"{detail_line}"
+    )
+
     # Optionally also send via Telegram
     if SEND_TELEGRAM_ALERTS and telegram_bot and chat_id:
         try:
             await telegram_bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"{emoji} *{coin_safe} Alert Triggered*\n\n"
-                    f"{coin_safe} crossed {direction} `${target:,.2f}`\n"
-                    f"Current price: `${current_price:,.2f}`"
-                ),
+                text=telegram_text,
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -205,11 +213,7 @@ async def send_alert_notification(
         try:
             await telegram_bot.send_message(
                 chat_id=chat_id,
-                text=(
-                    f"{emoji} *{coin_safe} Alert Triggered*\n\n"
-                    f"{coin_safe} crossed {direction} `${target:,.2f}`\n"
-                    f"Current price: `${current_price:,.2f}`"
-                ),
+                text=telegram_text,
                 parse_mode="Markdown",
             )
         except Exception as e:

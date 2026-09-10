@@ -1,4 +1,4 @@
-﻿"""Shared price fetching via Bybit REST API with multi-exchange fallbacks.
+"""Shared price fetching via Bybit REST API with multi-exchange fallbacks.
 
 Single source of truth for "current price" lookups used by the Telegram bot
 (commands, wizards, daily briefing) and for validating that a symbol exists.
@@ -23,6 +23,33 @@ _BYBIT_TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
 _client: httpx.AsyncClient | None = None
 _client_lock = asyncio.Lock()
 _cache: dict = {}  # symbol -> (ticker_dict, monotonic_ts)
+MAX_CACHE_ENTRIES = 500
+
+
+def _prune_cache() -> None:
+    """Keep memory bounded by evicting oldest entries when cache grows too large."""
+    if len(_cache) > MAX_CACHE_ENTRIES:
+        sorted_keys = sorted(_cache.keys(), key=lambda k: _cache[k][1])
+        for k in sorted_keys[: len(sorted_keys) // 5]:
+            _cache.pop(k, None)
+
+
+def format_price(price: float) -> str:
+    """Format a price dynamically based on magnitude (handles sub-cent coins cleanly)."""
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return "N/A"
+    if price != price or price == float("inf") or price <= 0:
+        return "N/A"
+    if price < 0.00001:
+        return f"${price:.8f}"
+    elif price < 0.001:
+        return f"${price:.6f}"
+    elif price < 1:
+        return f"${price:.4f}"
+    else:
+        return f"${price:,.2f}"
 
 
 def _ttl() -> int:
@@ -73,6 +100,7 @@ def register_live_price(symbol: str, price: float) -> None:
         "lastPrice": str(price),
         "price24hPcnt": pct,
     }
+    _prune_cache()
     _cache[symbol] = (ticker, now)
 
 
@@ -161,6 +189,7 @@ async def get_ticker(symbol: str):
         ticker = await _fetch_from_gateio(client, symbol)
 
     if ticker:
+        _prune_cache()
         _cache[symbol] = (ticker, now)
         return ticker
 

@@ -1,8 +1,7 @@
-"""Bybit WebSocket client for real-time price feeds."""
-
 import asyncio
 import json
 import logging
+import random
 import time
 
 import websockets
@@ -100,17 +99,19 @@ class BybitWebSocket:
             ws = self.ws
         if not symbols or not ws:
             return
+        success_count = 0
         for i in range(0, len(symbols), 10):
             batch = [f"tickers.{s}" for s in symbols[i:i + 10]]
             try:
                 await ws.send(json.dumps({"op": "subscribe", "args": batch}))
+                success_count += len(batch)
             except Exception as e:
                 logger.error(f"Failed to resubscribe batch: {e}")
-                return
-        logger.info(f"Resubscribed to {len(symbols)} stream(s)")
+                continue
+        logger.info(f"Resubscribed to {success_count}/{len(symbols)} stream(s)")
 
     async def _watchdog(self) -> None:
-        """Warn once for symbols that stop receiving ticks."""
+        """Warn and auto-resubscribe for symbols that stop receiving ticks."""
         try:
             while self._running:
                 await asyncio.sleep(60)
@@ -124,9 +125,13 @@ class BybitWebSocket:
                         self._stale_warned.add(symbol)
                         age = "never" if last is None else f"{now - last:.0f}s ago"
                         logger.warning(
-                            f"No Bybit ticks for {symbol} (last: {age}) — "
-                            "alerts still armed, stream may be stale."
+                            f"No Bybit ticks for {symbol} (last: {age}) — attempting re-subscribe."
                         )
+                        if self.ws:
+                            try:
+                                await self._send({"op": "subscribe", "args": [f"tickers.{symbol}"]})
+                            except Exception:
+                                pass
                     elif not stale:
                         self._stale_warned.discard(symbol)
         except asyncio.CancelledError:
@@ -134,8 +139,6 @@ class BybitWebSocket:
 
     async def run(self) -> None:
         """Main loop: connect, listen, auto-reconnect with backoff + jitter."""
-        import random
-
         self._running = True
         backoff = 1
         self._watchdog_task = asyncio.create_task(self._watchdog())

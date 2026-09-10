@@ -6,10 +6,18 @@ import logging
 import os
 import re
 
+import asyncio
+import config
+
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alerts.db")
+DB_PATH = (
+    config.DATABASE_PATH.strip()
+    if getattr(config, "DATABASE_PATH", None) and config.DATABASE_PATH.strip()
+    else os.path.join(os.path.dirname(os.path.abspath(__file__)), "alerts.db")
+)
 _db: aiosqlite.Connection | None = None
+_db_lock = asyncio.Lock()
 
 # Symbols are always stored normalized: uppercase alphanumerics ending in a
 # quote asset. Validation here is intentionally permissive (any XXXUSDT-style
@@ -49,10 +57,12 @@ async def get_db() -> aiosqlite.Connection:
     """Get or create the shared database connection."""
     global _db
     if _db is None:
-        _db = await aiosqlite.connect(DB_PATH)
-        await _db.execute("PRAGMA journal_mode=WAL")
-        await _db.execute("PRAGMA busy_timeout = 5000")
-        await _db.execute("PRAGMA foreign_keys = ON")
+        async with _db_lock:
+            if _db is None:
+                _db = await aiosqlite.connect(DB_PATH)
+                await _db.execute("PRAGMA journal_mode=WAL")
+                await _db.execute("PRAGMA busy_timeout = 5000")
+                await _db.execute("PRAGMA foreign_keys = ON")
     return _db
 
 
@@ -129,6 +139,7 @@ async def init_db() -> None:
     await db.execute("UPDATE alerts SET alert_type = 'price' WHERE alert_type IS NULL OR alert_type = ''")
 
     await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_alerts_expires ON alerts(expires_at)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_fired_symbol ON fired_log(symbol)")
     await db.commit()
 
@@ -438,6 +449,13 @@ async def get_active_symbols() -> set[str]:
     rows = await cursor.fetchall()
     await cursor.close()
     return {row[0] for row in rows}
+
+
+async def checkpoint_wal() -> None:
+    """Flush SQLite WAL frames into the main database file (guarantees consistent backup)."""
+    db = await get_db()
+    await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    await db.commit()
 
 
 async def close_db() -> None:

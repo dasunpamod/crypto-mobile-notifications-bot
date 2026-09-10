@@ -22,6 +22,9 @@ def _parse_user_id(raw: str) -> int:
         return 0
 
 
+# Path to SQLite database file (empty = default alerts.db in app directory).
+DATABASE_PATH: str = os.getenv("DATABASE_PATH", "").strip().strip("'\"")
+
 # Telegram bot token from @BotFather.
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip().strip("'\"")
 

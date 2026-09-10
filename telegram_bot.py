@@ -5,7 +5,7 @@ import logging
 import datetime
 import time
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 import database as db
@@ -13,7 +13,7 @@ import config
 from config import TELEGRAM_BOT_TOKEN
 from prices import (
     get_current_price, get_prices, get_ticker, get_tickers, get_top_movers,
-    cached_price, cached_ticker, ticker_price, ticker_change_24h,
+    cached_price, cached_ticker, ticker_price, ticker_change_24h, format_price,
 )
 from database import normalize_symbol, is_valid_symbol, parse_symbols
 
@@ -178,22 +178,6 @@ def _escape_md(text: str) -> str:
     for ch in ("_", "*", "[", "]", "`"):
         text = text.replace(ch, f"\\{ch}")
     return text
-
-
-def format_price(price: float) -> str:
-    """Format a price dynamically based on its magnitude."""
-    try:
-        price = float(price)
-    except (TypeError, ValueError):
-        return "N/A"
-    if price != price or price == float("inf") or price <= 0:
-        return "N/A"
-    if price < 0.001:
-        return f"${price:.6f}"
-    elif price < 1:
-        return f"${price:.4f}"
-    else:
-        return f"${price:,.2f}"
 
 
 async def _resolve_symbol(coin_or_symbol: str, engine=None) -> tuple | None:
@@ -1046,8 +1030,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 continue
             price = await get_current_price(symbol)
             if price is None:
-                skipped += 1
-                continue
+                price = engine.last_prices.get(symbol) or target
             atype = str(item.get("alert_type", "price") or "price")
             if atype not in ("price", "pct", "trail", "move", "funding"):
                 atype = "price"
@@ -1066,7 +1049,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             skipped += 1
     for sym in (data.get("watchlist") or [])[:25]:
         try:
-            if is_valid_symbol(sym) and await get_current_price(sym) is not None:
+            if is_valid_symbol(sym):
                 await db.add_watch(sym)
         except Exception:
             pass
@@ -1081,6 +1064,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No database file yet.")
         return
     try:
+        await db.checkpoint_wal()
         with open(db.DB_PATH, "rb") as f:
             await update.message.reply_document(document=f, caption="Database backup.")
     except Exception as e:
@@ -1643,11 +1627,43 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # Bot factory
 # ---------------------------------------------------------------------------
 
+async def _post_init(application: Application) -> None:
+    """Register command suggestions in Telegram UI autocomplete."""
+    commands = [
+        BotCommand("start", "Show interactive menu & buttons"),
+        BotCommand("help", "Show help & full command list"),
+        BotCommand("add", "Add a price alert (e.g. /add BTC 70000)"),
+        BotCommand("list", "View and manage active alerts"),
+        BotCommand("price", "Check current crypto prices"),
+        BotCommand("movers", "Top 24h market gainers & losers"),
+        BotCommand("pause", "Temporarily silence all alerts"),
+        BotCommand("resume", "Resume alerts immediately"),
+        BotCommand("snooze", "Snooze an alert (e.g. /snooze 1 2h)"),
+        BotCommand("unsnooze", "Unsnooze an alert (e.g. /unsnooze 1)"),
+        BotCommand("edit", "Change target price of an alert"),
+        BotCommand("remove", "Delete an alert by ID"),
+        BotCommand("history", "Recently fired alert history"),
+        BotCommand("watchlist", "View watchlist prices"),
+        BotCommand("watch", "Add coin to watchlist"),
+        BotCommand("unwatch", "Remove coin from watchlist"),
+        BotCommand("preset", "Set dip-buy or breakout bundles"),
+        BotCommand("status", "System & alert engine status"),
+        BotCommand("health", "Diagnostics & watchdog health"),
+        BotCommand("export", "Export alerts as JSON backup"),
+        BotCommand("import", "Import alerts from JSON backup"),
+        BotCommand("backup", "Download SQLite database file"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+    except Exception as e:
+        logger.warning(f"Failed to set bot commands: {e}")
+
+
 def create_bot(alert_engine, binance_ws) -> Application:
     """Create and configure the Telegram bot application."""
     if not TELEGRAM_BOT_TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN is not set — cannot create bot.")
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
     app.bot_data["engine"] = alert_engine
     app.bot_data["ws"] = binance_ws
 
