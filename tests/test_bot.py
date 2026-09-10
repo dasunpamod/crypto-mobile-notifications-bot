@@ -489,6 +489,65 @@ class TestWebSocketGuards(unittest.TestCase):
         _run(go())
 
 
+class TestNewPowerFeatures(unittest.TestCase):
+    def test_dexscreener_parser(self):
+        async def go():
+            import prices
+            from unittest.mock import AsyncMock, MagicMock
+            mock_client = MagicMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "pairs": [
+                    {
+                        "chainId": "solana",
+                        "dexId": "raydium",
+                        "baseToken": {"symbol": "PENGU", "address": "pengu123"},
+                        "priceUsd": "0.0345",
+                        "priceChange": {"h24": 15.2}
+                    }
+                ]
+            }
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            ticker = await prices._fetch_from_dexscreener(mock_client, "PENGUUSDT")
+            self.assertIsNotNone(ticker)
+            self.assertEqual(ticker["lastPrice"], "0.0345")
+            self.assertAlmostEqual(float(ticker["price24hPcnt"]), 0.152)
+        _run(go())
+
+    def test_notification_quick_action_buttons(self):
+        async def go():
+            import notifier
+            from unittest.mock import AsyncMock, MagicMock
+            mock_bot = MagicMock()
+            mock_bot.send_message = AsyncMock()
+            old_send = notifier.SEND_TELEGRAM_ALERTS
+            notifier.SEND_TELEGRAM_ALERTS = True
+            try:
+                await notifier.send_alert_notification(
+                    symbol="BTCUSDT",
+                    condition="above",
+                    target=80000.0,
+                    current_price=80050.0,
+                    telegram_bot=mock_bot,
+                    chat_id=12345,
+                    alert_id=42
+                )
+                self.assertTrue(mock_bot.send_message.called)
+                kwargs = mock_bot.send_message.call_args[1]
+                self.assertIn("reply_markup", kwargs)
+                self.assertIsNotNone(kwargs["reply_markup"])
+                buttons = kwargs["reply_markup"].inline_keyboard
+                self.assertEqual(len(buttons), 2)
+                self.assertIn("quick_add_BTCUSDT_above_", buttons[0][0].callback_data)
+                self.assertIn("quick_add_BTCUSDT_below_", buttons[0][1].callback_data)
+                self.assertEqual(buttons[1][0].callback_data, "quick_snooze_42_2h")
+                self.assertEqual(buttons[1][1].callback_data, "quick_del_42")
+            finally:
+                notifier.SEND_TELEGRAM_ALERTS = old_send
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
 

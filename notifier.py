@@ -197,6 +197,26 @@ async def send_alert_notification(
         f"{detail_line}"
     )
 
+    reply_markup = None
+    try:
+        from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+        if alert_id and current_price > 0:
+            p2_up = current_price * 1.02
+            p2_down = current_price * 0.98
+            kb = [
+                [
+                    InlineKeyboardButton(f"➕ +2% ({format_price(p2_up)})", callback_data=f"quick_add_{symbol}_above_{p2_up:.8g}"),
+                    InlineKeyboardButton(f"➕ -2% ({format_price(p2_down)})", callback_data=f"quick_add_{symbol}_below_{p2_down:.8g}"),
+                ],
+                [
+                    InlineKeyboardButton("🔕 Snooze 2h", callback_data=f"quick_snooze_{alert_id}_2h"),
+                    InlineKeyboardButton("❌ Remove", callback_data=f"quick_del_{alert_id}"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(kb)
+    except Exception:
+        reply_markup = None
+
     # Optionally also send via Telegram
     if SEND_TELEGRAM_ALERTS and telegram_bot and chat_id:
         try:
@@ -204,6 +224,7 @@ async def send_alert_notification(
                 chat_id=chat_id,
                 text=telegram_text,
                 parse_mode="Markdown",
+                reply_markup=reply_markup,
             )
         except Exception as e:
             logger.error(f"Failed to send Telegram alert: {e}")
@@ -215,6 +236,7 @@ async def send_alert_notification(
                 chat_id=chat_id,
                 text=telegram_text,
                 parse_mode="Markdown",
+                reply_markup=reply_markup,
             )
         except Exception as e:
             logger.error(f"Failed to send Telegram fallback alert: {e}")

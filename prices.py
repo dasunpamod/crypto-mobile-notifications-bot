@@ -164,8 +164,45 @@ async def _fetch_from_gateio(client: httpx.AsyncClient, symbol: str) -> dict | N
     return None
 
 
+async def _fetch_from_dexscreener(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    """Fallback to DexScreener for on-chain DEX tokens (Solana, Base, Ethereum, etc.)."""
+    try:
+        coin = symbol.replace("USDT", "").strip()
+        resp = await client.get(
+            f"https://api.dexscreener.com/latest/dex/search?q={coin}",
+            timeout=5.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            pairs = data.get("pairs") or []
+            if pairs and isinstance(pairs, list):
+                valid_pairs = []
+                for p in pairs[:10]:
+                    try:
+                        base = (p.get("baseToken") or {}).get("symbol", "").upper()
+                        if base == coin.upper() or p.get("baseToken", {}).get("address", "").lower() == coin.lower():
+                            price_usd = float(p.get("priceUsd") or 0)
+                            if price_usd > 0:
+                                valid_pairs.append(p)
+                    except Exception:
+                        continue
+                best = valid_pairs[0] if valid_pairs else (pairs[0] if float(pairs[0].get("priceUsd") or 0) > 0 else None)
+                if best:
+                    price = float(best.get("priceUsd") or 0)
+                    chg_24h = float((best.get("priceChange") or {}).get("h24") or 0) / 100.0
+                    return {
+                        "symbol": symbol,
+                        "lastPrice": str(price),
+                        "price24hPcnt": str(chg_24h),
+                        "source": f"dexscreener:{best.get('chainId')}",
+                    }
+    except Exception as e:
+        logger.debug(f"DexScreener ticker error for {symbol}: {e}")
+    return None
+
+
 async def get_ticker(symbol: str):
-    """Fetch ticker dict for a symbol (cached). Falls back to Binance.US/Gate.io if Bybit is geo-blocked."""
+    """Fetch ticker dict for a symbol (cached). Falls back to Binance.US/Gate.io/DexScreener if needed."""
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return None
@@ -187,6 +224,10 @@ async def get_ticker(symbol: str):
     # 3. Fallback to Gate.io (for coins not on Binance.US)
     if not ticker:
         ticker = await _fetch_from_gateio(client, symbol)
+
+    # 4. Fallback to DexScreener (for on-chain DEX / meme tokens)
+    if not ticker:
+        ticker = await _fetch_from_dexscreener(client, symbol)
 
     if ticker:
         _prune_cache()

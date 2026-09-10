@@ -741,8 +741,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Alerts:*\n"
         "`/add BTC 72500 above` [repeat] [7d] [cooldown=15m]\n"
         "`/add ETH 5% up repeat`\n"
-        "`/add BTC 76000,75000,79000 above` (multi)\n"
+        "`/add BTC 76000,75000,79000` (multi)\n"
         "`/add BTC,ETH 80000,4000 above` (ladder)\n"
+        "`/grid BTC 70000 80000 5` — automated price grid\n"
         "`/add BTC trail 5% below` (peak pullback)\n"
         "`/add BTC move 3% 60m` (% in window)\n"
         "`/add BTC funding 0.01% above`\n"
@@ -761,6 +762,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/watch BTC ETH` / `/unwatch BTC` / `/watchlist`\n"
         "`/export` backup file, `/import` restore (reply to file)\n"
         "`/backup` database file\n"
+        "`/update` — pull from git & restart (owner only)\n"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard(engine))
 
@@ -1154,6 +1156,156 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(f"Backup failed: {e}")
 
 
+@authorized
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/update — pull latest version from GitHub and restart service (owner only)."""
+    import asyncio
+    import subprocess
+    import sys
+
+    if not update.effective_user or update.effective_user.id != config.TELEGRAM_USER_ID:
+        await update.message.reply_text("Unauthorized: only the bot owner can update.")
+        return
+
+    msg = await update.message.reply_text("🔄 Checking for updates from GitHub...")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "pull", "origin", "main",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        out_str = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
+
+        log_proc = await asyncio.create_subprocess_exec(
+            "git", "log", "-1", "--pretty=format:%h - %s",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        log_out, _ = await log_proc.communicate()
+        commit_info = log_out.decode(errors="replace").strip()
+
+        if "Already up to date" in out_str:
+            await msg.edit_text(
+                f"✅ Bot is already up to date.\n\n*Current commit:*\n`{_escape_md(commit_info)}`",
+                parse_mode="Markdown"
+            )
+            return
+
+        await msg.edit_text(
+            f"🚀 *Update pulled successfully!*\n\n"
+            f"*New commit:*\n`{_escape_md(commit_info)}`\n\n"
+            f"🔄 Restarting service now...",
+            parse_mode="Markdown"
+        )
+
+        await asyncio.sleep(1.0)
+        try:
+            subprocess.Popen(["sudo", "systemctl", "restart", "crypto-alerts"])
+        except Exception:
+            subprocess.Popen([sys.executable] + sys.argv)
+            sys.exit(0)
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Update failed: `{_escape_md(str(e))}`", parse_mode="Markdown")
+
+
+@authorized
+async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/grid <coin> <low> <high> <count> [repeat] [expiry] — create an automated price alert grid."""
+    usage = (
+        "Usage:\n"
+        "`/grid <coin> <low> <high> <count> [repeat] [expiry]`\n\n"
+        "Example:\n"
+        "`/grid BTC 70000 80000 5`\n"
+        "`/grid SOL 90 120 4 repeat 7d`"
+    )
+    if not _check_rate_limit(update.effective_user.id):
+        await update.message.reply_text("Slow down — try again in a second.")
+        return
+
+    args = context.args or []
+    if len(args) < 4:
+        await update.message.reply_text(usage, parse_mode="Markdown")
+        return
+
+    raw_coin = args[0]
+    symbol = normalize_symbol(raw_coin)
+    if not is_valid_symbol(symbol):
+        await update.message.reply_text(f"Invalid symbol `{_escape_md(raw_coin)}`.", parse_mode="Markdown")
+        return
+
+    try:
+        low = float(args[1].replace(",", ""))
+        high = float(args[2].replace(",", ""))
+        count = int(args[3])
+    except ValueError:
+        await update.message.reply_text("Invalid numbers. Use: `/grid BTC 70000 80000 5`.", parse_mode="Markdown")
+        return
+
+    if low <= 0 or high <= 0 or low >= high:
+        await update.message.reply_text("Error: `<low>` must be positive and less than `<high>`.")
+        return
+
+    if not (2 <= count <= 10):
+        await update.message.reply_text("Count must be between 2 and 10.")
+        return
+
+    rest = [a.lower() for a in args[4:]]
+    is_persistent = "repeat" in rest
+    expires_at = None
+    for token in rest:
+        parsed = _parse_expiry(token)
+        if parsed and parsed != "invalid":
+            expires_at = parsed
+
+    max_alerts = _max_alerts()
+    if await db.count_alerts() + count > max_alerts:
+        await update.message.reply_text(f"Grid needs {count} alerts, but limit is {max_alerts}. Remove some first.")
+        return
+
+    engine = context.bot_data["engine"]
+    resolved = await _resolve_symbol(symbol, engine)
+    if resolved is None:
+        await update.message.reply_text(f"Invalid coin `{_escape_md(symbol)}`.", parse_mode="Markdown")
+        return
+    symbol, current_price = resolved
+    if current_price is None:
+        current_price = engine.last_prices.get(symbol)
+    if current_price is not None:
+        engine.last_prices[symbol] = current_price
+
+    step = (high - low) / (count - 1)
+    grid_prices = [low + i * step for i in range(count)]
+
+    ws = context.bot_data["ws"]
+    created = []
+    for price_target in grid_prices:
+        if current_price is not None:
+            condition = "above" if price_target > current_price else "below"
+            if price_target == current_price:
+                continue
+        else:
+            condition = "above"
+
+        aid = await db.add_alert(symbol, price_target, condition, is_persistent,
+                                 alert_type="price", expires_at=expires_at)
+        created.append((aid, price_target, condition))
+
+    await ws.subscribe(symbol)
+    coin = _escape_md(symbol.replace("USDT", ""))
+    now_str = f" (now {format_price(current_price)})" if current_price else ""
+    tag = " [repeat]" if is_persistent else ""
+    if expires_at:
+        tag += f" [expires {_fmt_ts(expires_at)}]"
+
+    lines = [f"🌐 *Grid created for {coin}*{now_str}{tag}:"]
+    for aid, target, condition in created:
+        lines.append(f"  • #{aid} {condition} *{format_price(target)}*")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # ---------------------------------------------------------------------------
 # Interactive UI Handlers
 # ---------------------------------------------------------------------------
@@ -1505,6 +1657,70 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _send_all_prices(query, engine, context=context)
         return
 
+    if data.startswith("quick_add_"):
+        # quick_add_<symbol>_<condition>_<target>
+        parts = data.split("_")
+        if len(parts) >= 5:
+            sym, cond, tgt_str = parts[2], parts[3], parts[4]
+            try:
+                tgt = float(tgt_str)
+                aid = await db.add_alert(sym, tgt, cond, False, alert_type="price")
+                ws = context.bot_data["ws"]
+                await ws.subscribe(sym)
+                coin = _escape_md(sym.replace("USDT", ""))
+                await query.answer(f"✅ Added alert #{aid}: {coin} {cond} {format_price(tgt)}")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            except Exception as e:
+                await query.answer(f"Error: {e}")
+        return
+
+    if data.startswith("quick_snooze_"):
+        # quick_snooze_<alert_id>_<duration>
+        parts = data.split("_")
+        if len(parts) >= 4:
+            aid_str, dur_str = parts[2], parts[3]
+            try:
+                aid = int(aid_str)
+                dur = _parse_duration(dur_str) or 7200
+                until = int(time.time()) + dur
+                await db.snooze_alert(aid, until)
+                await query.answer(f"🔕 Alert #{aid} snoozed for {dur_str}")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            except Exception as e:
+                await query.answer(f"Error: {e}")
+        return
+
+    if data.startswith("quick_del_"):
+        # quick_del_<alert_id>
+        parts = data.split("_")
+        if len(parts) >= 3:
+            try:
+                aid = int(parts[2])
+                alert = await db.get_alert(aid)
+                if alert:
+                    sym = alert[1]
+                    await db.remove_alert(aid)
+                    remaining = await db.get_alerts_for_symbol(sym)
+                    if not remaining:
+                        ws = context.bot_data["ws"]
+                        await ws.unsubscribe(sym)
+                    await query.answer(f"❌ Alert #{aid} removed")
+                else:
+                    await query.answer(f"Alert #{aid} already removed")
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            except Exception as e:
+                await query.answer(f"Error: {e}")
+        return
+
     if data.startswith("list_"):
         # list_<page>|<filt>
         try:
@@ -1764,6 +1980,8 @@ async def _post_init(application: Application) -> None:
         BotCommand("preset", "Set dip-buy or breakout bundles"),
         BotCommand("status", "System & alert engine status"),
         BotCommand("health", "Diagnostics & watchdog health"),
+        BotCommand("grid", "Create automated price alert grid"),
+        BotCommand("update", "Pull updates & restart bot (owner only)"),
         BotCommand("export", "Export alerts as JSON backup"),
         BotCommand("import", "Import alerts from JSON backup"),
         BotCommand("backup", "Download SQLite database file"),
@@ -1785,6 +2003,8 @@ def create_bot(alert_engine, binance_ws) -> Application:
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("grid", cmd_grid))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("removeall", cmd_removeall))
     app.add_handler(CommandHandler("list", cmd_list))

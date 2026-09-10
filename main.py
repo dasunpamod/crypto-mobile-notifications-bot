@@ -11,7 +11,7 @@ from database import close_db, get_active_symbols, init_db
 from binance_ws import BybitWebSocket
 from alert_engine import AlertEngine
 from telegram_bot import create_bot, format_price
-from prices import close_price_client, get_prices, get_ticker, ticker_price
+from prices import close_price_client, get_prices, get_ticker, ticker_price, get_current_price
 from notifier import close_notifier, flush_pending, ping_healthcheck
 import database as db
 
@@ -133,6 +133,30 @@ async def maintenance_task(app) -> None:
             await asyncio.sleep(300)
 
 
+async def rest_price_poller_task(engine) -> None:
+    """Polls REST/DexScreener for active symbols that are not receiving WebSocket ticks."""
+    while True:
+        try:
+            await asyncio.sleep(20)
+            symbols = await db.get_active_symbols()
+            now = datetime.datetime.now(datetime.timezone.utc)
+            for symbol in symbols:
+                last_ts = getattr(engine, "last_update_at", {}).get(symbol)
+                # If symbol hasn't received a tick in > 25 seconds, poll via REST/DexScreener
+                if not last_ts or (now - last_ts).total_seconds() > 25:
+                    try:
+                        price = await get_current_price(symbol)
+                        if price and price > 0:
+                            await engine.on_price_update(symbol, price)
+                    except Exception as e:
+                        logger.debug(f"REST price poll error for {symbol}: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"REST price poller error: {e}")
+            await asyncio.sleep(10)
+
+
 async def main() -> None:
     # ── Validate configuration ───────────────────────────────────────────
     problems = validate_config()
@@ -174,10 +198,11 @@ async def main() -> None:
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot started — send /help to your bot")
 
-    # ── Start Daily Briefing + maintenance/funding tasks ────────────────
+    # ── Start Daily Briefing + maintenance/funding/REST tasks ───────────
     briefing_task = asyncio.create_task(daily_briefing_task(app))
     maintenance_task_handle = asyncio.create_task(maintenance_task(app))
     funding_task = asyncio.create_task(funding_poller_task(engine))
+    rest_poller_task = asyncio.create_task(rest_price_poller_task(engine))
 
     # ── Graceful shutdown on SIGINT/SIGTERM ───────────────────────────────
     stop_event = asyncio.Event()
@@ -220,7 +245,8 @@ async def main() -> None:
         briefing_task.cancel()
         maintenance_task_handle.cancel()
         funding_task.cancel()
-        for bg in (ws_task, briefing_task, maintenance_task_handle, funding_task):
+        rest_poller_task.cancel()
+        for bg in (ws_task, briefing_task, maintenance_task_handle, funding_task, rest_poller_task):
             try:
                 await bg
             except asyncio.CancelledError:
