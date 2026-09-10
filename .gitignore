@@ -1,0 +1,26 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# SQLite database (incl. WAL sidecars)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Backups
+*.zip
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# IDEs
+.vscode/
+.idea/
