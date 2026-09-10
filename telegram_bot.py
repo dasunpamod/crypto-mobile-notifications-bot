@@ -1160,6 +1160,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/update — pull latest version from GitHub and restart service (owner only)."""
     import asyncio
+    import os
     import subprocess
     import sys
 
@@ -1168,18 +1169,28 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     msg = await update.message.reply_text("🔄 Checking for updates from GitHub...")
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
 
     try:
         proc = await asyncio.create_subprocess_exec(
             "git", "pull", "origin", "main",
+            cwd=repo_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
         out_str = (stdout.decode(errors="replace") + stderr.decode(errors="replace")).strip()
 
+        if proc.returncode != 0:
+            await msg.edit_text(
+                f"❌ Git pull failed (exit code {proc.returncode}):\n```\n{_escape_md(out_str[:400])}\n```",
+                parse_mode="Markdown"
+            )
+            return
+
         log_proc = await asyncio.create_subprocess_exec(
             "git", "log", "-1", "--pretty=format:%h - %s",
+            cwd=repo_dir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -1204,7 +1215,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         try:
             subprocess.Popen(["sudo", "systemctl", "restart", "crypto-alerts"])
         except Exception:
-            subprocess.Popen([sys.executable] + sys.argv)
+            subprocess.Popen([sys.executable] + sys.argv, cwd=repo_dir)
             sys.exit(0)
 
     except Exception as e:
@@ -2028,5 +2039,10 @@ def create_bot(alert_engine, binance_ws) -> Application:
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_callback))
+
+    async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.error(f"Telegram handler error: {context.error}", exc_info=context.error)
+
+    app.add_error_handler(_on_error)
 
     return app

@@ -305,6 +305,41 @@ class TestAlertEngine(unittest.TestCase):
                 os.unlink(tmp.name)
         _run(go())
 
+    def test_in_memory_expired_alert_skipped(self):
+        async def go():
+            import database as db
+            from alert_engine import AlertEngine
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                engine = AlertEngine()
+                sent = []
+
+                async def fake_notify(**kwargs):
+                    sent.append(kwargs)
+
+                import alert_engine as ae
+                old_notify = ae.send_alert_notification
+                ae.send_alert_notification = fake_notify
+                try:
+                    # Alert that expired in the past
+                    await db.add_alert("BTCUSDT", 70000, "above", False, expires_at="2020-01-01 00:00:00")
+                    # Force prune throttle to future so db.prune_expired does not run on this tick
+                    engine._last_prune_ts = 1e12
+                    await engine.on_price_update("BTCUSDT", 75000)
+                    # Should NOT fire because in-memory expires_at check skipped it!
+                    self.assertEqual(len(sent), 0)
+                finally:
+                    ae.send_alert_notification = old_notify
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
 
 
 class TestNewFeatures(unittest.TestCase):

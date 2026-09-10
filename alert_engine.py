@@ -3,6 +3,7 @@
 import asyncio
 import datetime
 import logging
+import time
 
 import database as db
 import config
@@ -57,6 +58,7 @@ class AlertEngine:
         self._locks: dict[str, asyncio.Lock] = {}
         self._stats = {"checks": 0, "triggered": 0, "errors": 0}
         self.started_at = datetime.datetime.now(datetime.timezone.utc)
+        self._last_prune_ts: float = 0.0
 
     def pause_alerts(self, hours: int) -> None:
         self.mute_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
@@ -198,12 +200,17 @@ class AlertEngine:
 
             lock = self._locks.setdefault(symbol, asyncio.Lock())
             async with lock:
-                try:
-                    pruned = await db.prune_expired()
-                    if pruned:
-                        logger.info(f"Pruned {pruned} expired alert(s)")
-                except Exception as e:
-                    logger.error(f"Failed to prune expired alerts: {e}")
+                # Throttle database cleanup to at most once every 60 seconds across all ticks
+                now_mono = time.monotonic()
+                if (now_mono - self._last_prune_ts) > 60:
+                    self._last_prune_ts = now_mono
+                    try:
+                        pruned = await db.prune_expired()
+                        if pruned:
+                            logger.info(f"Pruned {pruned} expired alert(s)")
+                    except Exception as e:
+                        logger.error(f"Failed to prune expired alerts: {e}")
+
                 alerts = await db.get_alerts_for_symbol(symbol)
                 if not alerts:
                     return
@@ -218,6 +225,7 @@ class AlertEngine:
                         is_persistent = bool(db.alert_field(alert, "is_persistent", 0))
                         last_triggered_at = db.alert_field(alert, "last_triggered_at")
                         alert_type = db.alert_field(alert, "alert_type", "price") or "price"
+                        expires_at = db.alert_field(alert, "expires_at")
                         snoozed_until = db.alert_field(alert, "snoozed_until")
                         cooldown = db.alert_field(alert, "cooldown_sec") or PERSISTENT_ALERT_COOLDOWN_SEC
                         try:
@@ -228,6 +236,11 @@ class AlertEngine:
                             "price", "pct", "trail", "move", "funding",
                         ):
                             continue
+                        # Expired alerts stay silent until pruned
+                        if expires_at:
+                            exp = _parse_utc_timestamp(expires_at)
+                            if exp and now >= exp:
+                                continue
                         # Snoozed alerts stay armed but silent. Second-resolution
                         # timestamps: treat the boundary second as still snoozed.
                         if snoozed_until:

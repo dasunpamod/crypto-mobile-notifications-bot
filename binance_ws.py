@@ -228,3 +228,8 @@ class BybitWebSocket:
     def stop(self) -> None:
         """Signal the WebSocket loop to stop."""
         self._running = False
+        if self.ws:
+            try:
+                asyncio.create_task(self.ws.close())
+            except Exception:
+                pass
