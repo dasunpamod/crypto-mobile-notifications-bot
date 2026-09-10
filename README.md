@@ -1,141 +1,212 @@
-# Crypto Telegram Alert Bot
+﻿# Crypto Mobile Notifications & Telegram Alert Bot
 
-A real-time cryptocurrency price alert bot for Telegram. It streams live prices
-over a Bybit WebSocket and fires alerts the moment a target is hit.
+A high-speed, real-time cryptocurrency alert system that delivers **instant, loud mobile push notifications directly to your phone via [ntfy](https://ntfy.sh)**, managed seamlessly through an interactive **Telegram Bot**. Powered by Bybit v5 WebSockets for sub-second price reaction.
 
-## Features
+---
 
-- **Real-time WebSocket:** Bybit v5 public stream with auto-reconnect,
-  batched resubscribe, stale-stream watchdog, and per-symbol locking so
-  rapid ticks can't double-fire.
-- **App-like Telegram UI:** Reply keyboard + inline buttons for add, remove,
-  price checks (all coins at once), pause/resume, and a paginated alert list.
-- **Alert types:** one-shot and repeating price alerts, percentage (`5%`),
-  trailing (`trail`), time-window (`move`), and funding-rate alerts.
-- **One-tap price board:** `💰 Check Price` / `Prices: All` shows your whole
-  watchlist + active-alert coins in a single message — no more pressing one
-  coin at a time. Customize with `/watch` or `WATCHLIST_SYMBOLS`.
-- **Instant-fire guard:** `/add` rejects targets whose condition is already
-  true, so alerts never fire-and-delete on creation.
-- **Expiry, snooze, cooldown:** `/add ... 7d`, `/snooze 3 24h`,
-  `cooldown=15m` per alert.
-- **Daily briefing:** Configurable time/coins (`DAILY_BRIEFING_TIME`,
-  `DAILY_BRIEFING_SYMBOLS`), fetched concurrently with a short TTL cache.
-- **Pause / quiet hours:** One-tap mute (`/pause [15m|2h]`) and optional
-  `QUIET_HOURS_UTC` window where alerts stay armed but silent.
-- **Notifications:** ntfy.sh push with automatic Telegram fallback, a retry
-  queue (`pending_notifications`) flushed hourly, optional webhook + auth,
-  healthcheck pings, and per-type priority.
-- **History & health:** `/history` logs every fired alert; `/status` and
-  `/health` show connection, reconnects, queue depth, stream freshness.
-- **Backups:** `/export` (JSON) and `/backup` (SQLite file) to a friendlier
-  `/import`.
-- **Fail-closed auth:** The bot answers *nobody* until `TELEGRAM_USER_ID` is set.
+## 🚨 Why Mobile Notifications via ntfy?
 
-## Prerequisites
+Traditional Telegram messages often get lost in noisy chat lists, muted channels, or delayed by battery-saving background restrictions. This bot solves that by combining **ntfy mobile push** with **Telegram controls**:
+
+- 🔊 **Loud Phone Alarms & Siren Sounds:** Trigger distinct, high-urgency ringtones on your mobile device for critical breakout or liquidation targets.
+- 📱 **Lock-Screen Banners:** Immediate push notifications delivered to Android and iOS via the free, open-source **ntfy** app.
+- 🌙 **Bypass Silent / Do Not Disturb:** Configure high-priority alerts (`max` or `high`) to ring through DND on your phone for emergency market moves.
+- 🔒 **Zero Account / Sign-up Required:** Simply pick a private topic name and subscribe in the ntfy app — no email or phone number needed.
+- 🛡️ **Dual-Channel Reliability & Fallback:** If ntfy push fails or is unreachable, the system automatically falls back to Telegram direct messages and queues retries.
+- 🌐 **Self-Hostable or Free Cloud:** Works out-of-the-box with the public `https://ntfy.sh` server or your own private self-hosted ntfy instance.
+
+---
+
+## 📲 Quick Setup: Mobile Push Notifications (ntfy)
+
+Setting up loud phone notifications takes less than 60 seconds:
+
+1. **Install the ntfy app:**
+   - **Android:** [Google Play](https://play.google.com/store/apps/details?id=io.heckel.ntfy) or [F-Droid](https://f-droid.org/packages/io.heckel.ntfy/)
+   - **iOS:** [Apple App Store](https://apps.apple.com/app/ntfy/id1625396347)
+   - **Desktop / Web:** Works directly in any browser at [ntfy.sh](https://ntfy.sh)
+
+2. **Subscribe to a private topic:**
+   - Open the ntfy app and tap **+** (Subscribe to topic).
+   - Enter a unique, hard-to-guess topic name (e.g. `trader_crypto_alerts_987x`).
+
+3. **Configure loud sounds (Optional but Recommended):**
+   - In the ntfy app settings for your topic, enable **Override Do Not Disturb** and set a loud ringtone (e.g. Siren / Alarm) so critical price moves wake you up.
+
+4. **Add the topic to your `.env`:**
+   ```bash
+   NTFY_TOPIC=trader_crypto_alerts_987x
+   NTFY_SERVER=https://ntfy.sh
+   ALERT_PRIORITY_ONESHOT=high
+   ALERT_PRIORITY_REPEAT=default
+   ```
+
+---
+
+## ✨ Key Features
+
+- **Sub-second WebSocket Stream:** Direct Bybit v5 public WebSocket feed with auto-reconnect, batched resubscription, stale-stream watchdog, and per-symbol locking to prevent double-firing.
+- **Mobile Push (ntfy):** High/max priority alerts, custom sound tags, retry queues (`pending_notifications`), and webhook integrations.
+- **App-Like Telegram UI:** Reply keyboard + inline interactive buttons for instant add, remove, pause/resume, and paginated alert listings.
+- **Diverse Alert Types:**
+  - **Price Targets:** Fixed price thresholds (`above` / `below`).
+  - **Percentage Moves:** Relative percent alerts (`BTC 5% above`).
+  - **Trailing Alerts:** Trailing stop / pullback alerts (`BTC trail 5% below` tracking from peak).
+  - **Time-Window Velocity:** Rapid price pump/dump detection (`BTC move 3% 60m`).
+  - **Funding Rates:** Perpetual contract funding rate thresholds (`BTC funding 0.01% above`).
+- **One-Tap Price Board:** `💰 Check Price` shows your entire watchlist and active-alert coins in one clean message.
+- **Instant-Fire Protection:** Rejects targets whose conditions are already met on creation so alerts never trigger-and-delete instantly.
+- **Expiry, Snooze & Cooldowns:** Self-expiring alerts (`7d`), per-alert cooldowns (`cooldown=15m`), and temporary mutes (`/snooze 3 24h`).
+- **Daily Market Briefing:** Scheduled daily recap (`DAILY_BRIEFING_TIME`) covering selected coins with 24h performance stats.
+- **Quiet Hours & Global Pause:** One-tap silence button (`/pause 1h`) and UTC quiet-hours windows where alerts arm silently without ringing your phone.
+- **Fail-Closed Security:** Rejects all unauthorized users — the bot will only respond to your verified `TELEGRAM_USER_ID`.
+
+---
+
+## 🛠️ Installation & Setup
+
+### Prerequisites
 
 - Python 3.10+
-- A Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
-- Your Telegram User ID (from [@userinfobot](https://t.me/userinfobot)) — required.
+- Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
+- Your Telegram User ID (from [@userinfobot](https://t.me/userinfobot))
+- ntfy app installed on your phone (free from iOS App Store or Google Play)
 
-## Installation
+### 1. Clone the repository
+```bash
+git clone https://github.com/dasunpamod/crypto-mobile-notifications-bot.git
+cd crypto-mobile-notifications-bot
+```
 
-1. **Clone the repository:**
-   ```bash
-   git clone https://github.com/yourusername/crypto-alerts.git
-   cd crypto-alerts
-   ```
+### 2. Create virtual environment
+```bash
+python3 -m venv venv
+# On Linux/macOS:
+source venv/bin/activate
+# On Windows:
+.\venv\Scripts\activate
+```
 
-2. **Create a virtual environment:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
+### 3. Install dependencies
+```bash
+pip install -r requirements.txt
+```
 
-3. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 4. Configure environment variables
+Copy the template and fill in your keys:
+```bash
+cp .env.example .env
+```
 
-4. **Set up your environment variables:**
-   Copy the example environment file and add your keys:
-   ```bash
-   cp .env.example .env
-   nano .env
-   ```
-   *(Fill in `TELEGRAM_BOT_TOKEN` and `TELEGRAM_USER_ID`. `NTFY_TOPIC` is
-   optional — without it, alerts fall back to Telegram.)*
+Edit `.env`:
+```env
+# Required Telegram credentials
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_USER_ID=your_telegram_user_id_here
 
-5. **Run the bot:**
-   ```bash
-   python main.py
-   ```
+# Mobile Push Notifications (ntfy)
+NTFY_TOPIC=your_private_topic_name_here
+NTFY_SERVER=https://ntfy.sh
+SEND_TELEGRAM_ALERTS=true
 
-## Commands
+# Notification Priorities
+ALERT_PRIORITY_ONESHOT=high
+ALERT_PRIORITY_REPEAT=default
+```
 
-| Command | Example | Notes |
+### 5. Run the bot
+```bash
+python main.py
+```
+
+---
+
+## 💬 Telegram Commands & Controls
+
+| Command | Example | Description |
 |---|---|---|
-| `/add` | `/add BTC 72500 above [repeat] [7d] [cooldown=15m]` | price or `5%`, `above`/`below` |
-| `/add` | `/add BTC,ETH 120000,5000 above` | ladder (1:1 coins/targets) |
-| `/add` | `/add BTC trail 5% below` | fires on `5%` pullback from the peak |
-| `/add` | `/add BTC move 3% 60m` | fires on `3%` move within 60 minutes |
-| `/add` | `/add BTC funding 0.01% above` | fires on funding-rate threshold |
-| `/list [coin]` | `/list SOL` | paginated; inline Edit/Snooze/Remove buttons |
-| `/edit` | `/edit 3 76000 above` | retarget a price alert |
-| `/snooze` | `/snooze 3 24h` | silence one alert (`/unsnooze 3` to undo) |
-| `/remove` | `/remove 3` | removes one alert |
-| `/removeall` | `/removeall` | asks for confirmation first |
-| `/price [coins...]` | `/price` or `/price SOL AVAX` | no args = whole watchlist at once |
-| `/movers [n]` | `/movers 10` | top 24h movers |
-| `/history [n]` | `/history 5` | recently fired alerts |
-| `/status` | `/status` | connection, tracked symbols, engine counters |
-| `/health` | `/health` | reconnects, queue depth, stale streams |
-| `/pause` / `/resume` | `/pause 15m` | global mute with optional duration |
-| `/watch` / `/unwatch` | `/watch SUI` | customize the one-tap price board |
-| `/watchlist` | `/watchlist` | show the price board |
-| `/preset` | `/preset dip-buy` | one-tap alert bundles |
-| `/export` / `/import` | `/export` | JSON backup / restore from a file |
-| `/backup` | `/backup` | raw SQLite database file |
-| `/help` | `/help` | full examples (also handles `/start`) |
+| `/add` | `/add BTC 72500 above [repeat] [7d] [cooldown=15m]` | Fixed target or percentage alert |
+| `/add` | `/add BTC,ETH 120000,5000 above` | Multi-coin ladder |
+| `/add` | `/add BTC trail 5% below` | Fires on 5% pullback from peak |
+| `/add` | `/add BTC move 3% 60m` | Fires on 3% move within 60 minutes |
+| `/add` | `/add BTC funding 0.01% above` | Fires on funding rate threshold |
+| `/list [coin]` | `/list SOL` | Paginated alert list with inline Edit/Snooze/Delete |
+| `/edit` | `/edit 3 76000 above` | Update existing target |
+| `/snooze` | `/snooze 3 24h` | Silence an alert (`/unsnooze 3` to re-enable) |
+| `/remove` | `/remove 3` | Remove single alert |
+| `/removeall` | `/removeall` | Delete all alerts (with confirmation prompt) |
+| `/price [coins]` | `/price` or `/price SOL AVAX` | Full watchlist price board |
+| `/movers [n]` | `/movers 10` | Top 24h market gainers & losers |
+| `/history [n]` | `/history 5` | Log of recently triggered alerts |
+| `/watch` / `/unwatch` | `/watch SUI` | Customize one-tap price board coins |
+| `/pause` / `/resume` | `/pause 1h` | Global mute with optional duration |
+| `/status` / `/health` | `/status` | Connection health, queue depth, watchdog stats |
+| `/export` / `/backup` | `/export` | Export alerts as JSON or raw SQLite database |
+| `/help` | `/help` | Full interactive guide and example syntax |
 
-## Notification options (`.env`)
+---
 
-`NTFY_TOPIC`, `NTFY_SERVER`, `NTFY_TOKEN`/`NTFY_USER`/`NTFY_PASSWORD`,
-`SEND_TELEGRAM_ALERTS`, `ALERT_PRIORITY_ONESHOT`/`ALERT_PRIORITY_REPEAT`,
-`WEBHOOK_URL` (JSON POST on trigger), `HEALTHCHECK_URL` (hourly ping).
+## 🔔 Notification Architecture & Options
 
-## Tests
+Configure your alert delivery in `.env`:
 
-Stdlib only, no network access (Bybit calls are stubbed):
+```env
+# Mobile push server (public or self-hosted)
+NTFY_SERVER=https://ntfy.sh
+NTFY_TOPIC=your_private_topic
+
+# Optional authentication for private ntfy servers
+#NTFY_TOKEN=
+#NTFY_USER=
+#NTFY_PASSWORD=
+
+# Push priorities: max | high | default | low | min
+ALERT_PRIORITY_ONESHOT=high
+ALERT_PRIORITY_REPEAT=default
+
+# Dual-delivery: also send message directly inside Telegram chat
+SEND_TELEGRAM_ALERTS=true
+
+# Outgoing webhook for external home automation / Discord
+#WEBHOOK_URL=https://hooks.example.com/alert
+
+# Heartbeat monitor (e.g. Uptime Kuma, healthchecks.io)
+#HEALTHCHECK_URL=https://hc-ping.com/your-uuid
+```
+
+---
+
+## 🧪 Running Tests
+
+Tests run offline with stdlib `unittest` (no network required):
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## Project layout
+---
 
-- `main.py` — startup, config validation, graceful shutdown
-- `telegram_bot.py` — commands, wizard, callbacks, `/status`
-- `prices.py` — shared Bybit REST client + TTL cache (single price source)
-- `binance_ws.py` — Bybit WebSocket client (name kept for compatibility)
-- `alert_engine.py` — threshold checks, cooldowns, mute, per-symbol locks
-- `notifier.py` — ntfy + Telegram delivery with fallback
-- `database.py` — SQLite storage, validation, migrations, index on `symbol`
-- `config.py` — env parsing with defensive defaults + `validate_config()`
-- `tests/` — offline unit tests
+## 🚀 Easy 24/7 Cloud Deployment (GCP Always Free)
 
-## Easy GCP Deployment
+Deploy directly on a **Google Cloud Always Free Tier (e2-micro)** Ubuntu VM:
 
-This project includes a `setup-gcp.sh` script specifically designed for the
-**Google Cloud Always Free Tier** (e2-micro instance running Ubuntu).
+1. Upload the project to your VM.
+2. Run the automated installer:
+   ```bash
+   bash setup-gcp.sh
+   ```
+3. The script configures Python, installs packages, prompts for configuration, and sets up a resilient `systemd` background service that auto-restarts on reboot.
 
-1. Upload the project to your GCP instance.
-2. Run `bash setup-gcp.sh`.
-3. The script will automatically install Python, create the virtual environment, install packages, prompt you for your API keys, and configure a `systemd` background service so the bot runs 24/7.
+---
 
-## Technologies Used
+## 📦 Project Structure
 
-- `python-telegram-bot` (Telegram UI and commands)
-- `websockets` (Bybit v5 live data stream)
-- `aiosqlite` (Persistent alert storage with schema migrations)
-- `httpx` (Async REST API calls)
+- `main.py` — Orchestrator, health monitor, and graceful shutdown.
+- `notifier.py` — High-priority ntfy mobile push engine with Telegram fallback and retry queue.
+- `telegram_bot.py` — Rich Telegram UI, keyboard controls, command handlers, and wizards.
+- `alert_engine.py` — Multi-type condition evaluation, trailing stop tracking, velocity windows.
+- `binance_ws.py` — Low-latency Bybit v5 WebSocket client with watchdog and auto-resubscription.
+- `prices.py` — Shared Bybit REST client with TTL cache for instant quotes.
+- `database.py` — Async SQLite storage, migrations, and index optimization.
+- `config.py` — Defensive environment variable validation.
+- `tests/` — Offline test suite for bot logic, parsing, and database operations.
