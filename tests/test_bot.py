@@ -790,6 +790,44 @@ class TestWebhookServer(unittest.TestCase):
 
         _run(go())
 
+    def test_export_import_is_urgent(self):
+        async def go():
+            import database as db
+            import json
+            from telegram_bot import cmd_export, cmd_import
+            from unittest.mock import AsyncMock, MagicMock
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                aid = await db.add_alert("BTCUSDT", 70000, "above", is_urgent=True)
+                alerts = await db.get_all_alerts()
+                cols = ["id", "symbol", "target", "condition", "created_at", "is_persistent",
+                        "last_triggered_at", "alert_type", "expires_at", "snoozed_until",
+                        "cooldown_sec", "pct", "window_min", "base_price", "peak_price", "funding_rate", "is_urgent"]
+                exported_data = [dict(zip(cols, list(a) + [None] * (len(cols) - len(a)))) for a in alerts]
+                self.assertEqual(exported_data[0]["is_urgent"], 1)
+
+                # Simulate import
+                await db.remove_alert(aid)
+                self.assertEqual(await db.count_alerts(), 0)
+
+                item = exported_data[0]
+                new_aid = await db.add_alert(
+                    item["symbol"], item["target"], item["condition"], bool(item["is_persistent"]),
+                    is_urgent=bool(item.get("is_urgent", 0))
+                )
+                imported_alert = await db.get_alert(new_aid)
+                self.assertEqual(db.alert_field(imported_alert, "is_urgent"), 1)
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
 
 if __name__ == "__main__":
     unittest.main()

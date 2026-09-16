@@ -256,6 +256,7 @@ async def main() -> None:
         briefing_task.cancel()
         maintenance_task_handle.cancel()
         funding_task.cancel()
+        heartbeat_task_handle.cancel()
         bg_tasks = [ws_task, briefing_task, maintenance_task_handle, funding_task, heartbeat_task_handle]
         if webhook_task:
             from webhook_server import stop_webhook_server

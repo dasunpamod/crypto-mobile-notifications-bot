@@ -172,10 +172,18 @@ class AlertEngine:
                         until = _parse_utc_timestamp(snoozed_until)
                         if until and now <= until:
                             continue
+                    if db.alert_field(alert, "is_persistent", 0):
+                        last_triggered = db.alert_field(alert, "last_triggered_at")
+                        cooldown = db.alert_field(alert, "cooldown_sec") or config.ALERT_COOLDOWN_SECONDS
+                        if last_triggered:
+                            last_time = _parse_utc_timestamp(last_triggered)
+                            if last_time and (now - last_time).total_seconds() < cooldown:
+                                continue
                     hit = (condition == "above" and funding_rate >= threshold) or (
                         condition == "below" and funding_rate <= threshold)
                     if hit:
                         self._stats["triggered"] += 1
+                        is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
                         logger.info(f"Funding alert #{alert_id} triggered: {symbol} "
                                     f"{condition} {threshold:+.4%} (now {funding_rate:+.4%})")
                         await send_alert_notification(
@@ -183,6 +191,7 @@ class AlertEngine:
                             current_price=funding_rate * 100, telegram_bot=self.telegram_bot,
                             chat_id=self.chat_id, priority=self._priority(True),
                             detail=f"funding {funding_rate:+.4%}", alert_id=alert_id,
+                            is_urgent=is_urgent,
                         )
                         await db.log_fired(alert_id, symbol, condition, threshold * 100,
                                            funding_rate * 100, f"funding {funding_rate:+.4%}")
@@ -278,18 +287,18 @@ class AlertEngine:
                             triggered_any = True
                             await self._fire(alert, price)
                         elif alert_type == "pct":
-                            pct = db.alert_field(alert, "pct") or 0
+                            rule_pct = db.alert_field(alert, "pct") or 0
                             base = db.alert_field(alert, "base_price") or 0
-                            if not (pct and base):
+                            if not (rule_pct and base):
                                 continue
                             move = (price - base) / base * 100
-                            if (condition == "above" and move >= pct) or (
-                                condition == "below" and move <= -pct
+                            if (condition == "above" and move >= rule_pct) or (
+                                condition == "below" and move <= -rule_pct
                             ):
                                 triggered_any = True
                                 await self._fire(alert, price, f"{move:+.2f}% from {format_price(base)}")
                         elif alert_type == "trail":
-                            pct = db.alert_field(alert, "pct") or 0
+                            rule_pct = db.alert_field(alert, "pct") or 0
                             peak = db.alert_field(alert, "peak_price") or price
                             if price > peak:
                                 try:
@@ -297,18 +306,18 @@ class AlertEngine:
                                 except Exception as e:
                                     logger.error(f"Failed to update peak #{alert_id}: {e}")
                                 continue
-                            if peak > 0 and pct:
+                            if peak > 0 and rule_pct:
                                 drop = (peak - price) / peak * 100
-                                if drop >= pct:
+                                if drop >= rule_pct:
                                     triggered_any = True
                                     await self._fire(alert, price, f"{drop:.2f}% below peak {format_price(peak)}")
                         elif alert_type == "move":
-                            pct = db.alert_field(alert, "pct") or 0
+                            rule_pct = db.alert_field(alert, "pct") or 0
                             base = db.alert_field(alert, "base_price") or 0
                             window_min = db.alert_field(alert, "window_min") or 0
                             anchor_ts = db.alert_field(alert, "last_triggered_at") or db.alert_field(alert, "created_at")
                             anchor = _parse_utc_timestamp(anchor_ts)
-                            if not (pct and base and window_min):
+                            if not (rule_pct and base and window_min):
                                 continue
                             if anchor and (now - anchor).total_seconds() > window_min * 60:
                                 # Window elapsed without triggering — re-anchor.
@@ -318,7 +327,7 @@ class AlertEngine:
                                     logger.error(f"Failed to re-anchor #{alert_id}: {e}")
                                 continue
                             move = (price - base) / base * 100
-                            if abs(move) >= pct:
+                            if abs(move) >= rule_pct:
                                 triggered_any = True
                                 await self._fire(alert, price, f"{move:+.2f}% in {window_min}m")
                         # funding alerts are evaluated by the funding poller, not ticks.

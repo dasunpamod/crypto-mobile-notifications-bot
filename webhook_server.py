@@ -8,6 +8,7 @@ Zero external dependencies (uses standard library asyncio HTTP server).
 import asyncio
 import json
 import logging
+import secrets
 import urllib.parse
 
 import config
@@ -21,11 +22,13 @@ _server = None
 def _parse_http_request(raw_data: bytes) -> tuple[str, str, dict, str]:
     """Parse a basic HTTP request. Returns (method, path, headers, body)."""
     text = raw_data.decode("utf-8", errors="replace")
-    parts = text.split("\r\n\r\n", 1)
-    header_part = parts[0]
+    if "\r\n\r\n" in text:
+        parts = text.split("\r\n\r\n", 1)
+        lines = parts[0].split("\r\n")
+    else:
+        parts = text.split("\n\n", 1)
+        lines = parts[0].split("\n")
     body = parts[1] if len(parts) > 1 else ""
-
-    lines = header_part.split("\r\n")
     if not lines or not lines[0]:
         return "", "", {}, ""
 
@@ -50,7 +53,13 @@ def _escape_md(text: str) -> str:
 
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, telegram_bot=None) -> None:
     try:
-        data = await reader.read(65536)
+        try:
+            data = await asyncio.wait_for(reader.read(65536), timeout=10.0)
+        except asyncio.TimeoutError:
+            writer.close()
+            await writer.wait_closed()
+            return
+
         if not data:
             writer.close()
             await writer.wait_closed()
@@ -70,7 +79,7 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             return
 
         # Webhook endpoint: POST /webhook or POST /webhook/<secret>
-        if method != "POST" or not path_only.startswith("/webhook"):
+        if method != "POST" or (path_only != "/webhook" and not path_only.startswith("/webhook/")):
             response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
             writer.write(response.encode("utf-8"))
             await writer.drain()
@@ -78,20 +87,32 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             await writer.wait_closed()
             return
 
-        # Validate secret if configured
+        # Validate secret: Fail-closed (require configured secret)
         expected_secret = (config.WEBHOOK_SECRET or "").strip()
-        if expected_secret:
-            path_secret = path_only.replace("/webhook", "").strip("/")
-            header_secret = headers.get("x-webhook-secret", "")
-            if path_secret != expected_secret and header_secret != expected_secret:
-                logger.warning("Rejected unauthorized webhook attempt (secret mismatch)")
-                err_body = "{\"error\":\"unauthorized\"}"
-                response = f"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {len(err_body)}\r\nConnection: close\r\n\r\n{err_body}"
-                writer.write(response.encode("utf-8"))
-                await writer.drain()
-                writer.close()
-                await writer.wait_closed()
-                return
+        if not expected_secret:
+            logger.warning("Rejected webhook attempt: WEBHOOK_SECRET is not configured in .env")
+            err_body = "{\"error\":\"unauthorized\"}"
+            response = f"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {len(err_body)}\r\nConnection: close\r\n\r\n{err_body}"
+            writer.write(response.encode("utf-8"))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        path_secret = path_only[len("/webhook/"):].strip("/") if path_only.startswith("/webhook/") else ""
+        header_secret = headers.get("x-webhook-secret", "")
+        valid_path = secrets.compare_digest(path_secret, expected_secret) if path_secret else False
+        valid_header = secrets.compare_digest(header_secret, expected_secret) if header_secret else False
+
+        if not (valid_path or valid_header):
+            logger.warning("Rejected unauthorized webhook attempt (secret mismatch)")
+            err_body = "{\"error\":\"unauthorized\"}"
+            response = f"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {len(err_body)}\r\nConnection: close\r\n\r\n{err_body}"
+            writer.write(response.encode("utf-8"))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            return
 
         # Parse body (JSON or raw text)
         ticker = ""
@@ -151,7 +172,24 @@ async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     parse_mode="Markdown"
                 )
             except Exception as e:
-                logger.error(f"Failed to forward webhook to Telegram: {e}")
+                logger.warning(f"Failed to forward webhook via Markdown, trying plain text: {e}")
+                try:
+                    plain_lines = ["🔔 External Webhook Alert"]
+                    if ticker:
+                        plain_lines.append(f"Ticker: {ticker}")
+                    if action:
+                        plain_lines.append(f"Action: {action}")
+                    if price:
+                        plain_lines.append(f"Price: ${price}")
+                    if message_text:
+                        plain_lines.append(f"\n{message_text}")
+                    await telegram_bot.send_message(
+                        chat_id=config.TELEGRAM_USER_ID,
+                        text="\n".join(plain_lines),
+                        parse_mode=None
+                    )
+                except Exception as inner_e:
+                    logger.error(f"Failed plain text forward: {inner_e}")
 
         # Respond HTTP 200
         resp_body = "{\"status\":\"ok\",\"received\":true}"

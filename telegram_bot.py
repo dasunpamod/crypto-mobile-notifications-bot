@@ -1140,12 +1140,15 @@ async def cmd_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @authorized
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/export — send alerts + watchlist as a JSON backup file."""
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("This command can only be used in a private chat with the bot.")
+        return
     import io
     import json
     alerts = await db.get_all_alerts()
     cols = ["id", "symbol", "target", "condition", "created_at", "is_persistent",
             "last_triggered_at", "alert_type", "expires_at", "snoozed_until",
-            "cooldown_sec", "pct", "window_min", "base_price", "peak_price", "funding_rate"]
+            "cooldown_sec", "pct", "window_min", "base_price", "peak_price", "funding_rate", "is_urgent"]
     data = {"alerts": [dict(zip(cols, list(a) + [None] * (len(cols) - len(a)))) for a in alerts]}
     try:
         data["watchlist"] = await db.get_watchlist()
@@ -1200,6 +1203,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             atype = str(item.get("alert_type", "price") or "price")
             if atype not in ("price", "pct", "trail", "move", "funding"):
                 atype = "price"
+            is_urgent = bool(item.get("is_urgent", 0))
             await db.add_alert(
                 symbol, target, condition, bool(item.get("is_persistent", 0)),
                 alert_type=atype, expires_at=item.get("expires_at"),
@@ -1207,7 +1211,8 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 window_min=item.get("window_min"),
                 base_price=item.get("base_price") or price,
                 peak_price=item.get("peak_price") or price,
-                funding_rate=item.get("funding_rate"))
+                funding_rate=item.get("funding_rate"),
+                is_urgent=is_urgent)
             await ws.subscribe(symbol)
             made += 1
         except Exception:
@@ -1224,6 +1229,9 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @authorized
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/backup — send the raw SQLite database file."""
+    if update.effective_chat and update.effective_chat.type != "private":
+        await update.message.reply_text("This command can only be used in a private chat with the bot.")
+        return
     import os as _os
     if not _os.path.exists(db.DB_PATH):
         await update.message.reply_text("No database file yet.")
@@ -1399,213 +1407,6 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Interactive UI Handlers
 # ---------------------------------------------------------------------------
 
-def _parse_duration(text: str):
-    """Parse '15m'/'2h'/'7d'/seconds -> seconds. None if invalid."""
-    text = (text or "").strip().lower()
-    try:
-        if text.endswith("m"):
-            return int(text[:-1]) * 60
-        if text.endswith("h"):
-            return int(text[:-1]) * 3600
-        if text.endswith("d"):
-            return int(text[:-1]) * 86400
-        return int(text.rstrip("s"))
-    except ValueError:
-        return None
-
-
-@authorized
-async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/edit <id> <price> [above|below] — change a price alert's target."""
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/edit 3 76000 above`", parse_mode="Markdown")
-        return
-    try:
-        alert_id = int(args[0])
-        target = float(args[1].replace(",", ""))
-    except ValueError:
-        await update.message.reply_text("Usage: `/edit 3 76000 above`", parse_mode="Markdown")
-        return
-    if not (0 < target <= MAX_PRICE_VALUE):
-        await update.message.reply_text("Target price is out of range.")
-        return
-    alert = await db.get_alert(alert_id)
-    if not alert:
-        await update.message.reply_text(f"Alert #{alert_id} not found.")
-        return
-    atype = db.alert_field(alert, "alert_type", "price") or "price"
-    if atype != "price":
-        await update.message.reply_text("Only price alerts can be edited — recreate trail/move ones.")
-        return
-    condition = (args[2].lower() if len(args) > 2 else db.alert_field(alert, "condition", "above"))
-    if condition == "up":
-        condition = "above"
-    if condition == "down":
-        condition = "below"
-    if condition not in ("above", "below"):
-        await update.message.reply_text("Condition must be `above` or `below`.", parse_mode="Markdown")
-        return
-    try:
-        await db.set_target(alert_id, target, condition)
-    except ValueError as e:
-        await update.message.reply_text(f"Could not edit: {e}")
-        return
-    coin = _escape_md(db.alert_field(alert, "symbol", "").replace("USDT", ""))
-    await update.message.reply_text(f"Alert #{alert_id} updated: *{coin}* {condition} *{format_price(target)}*.",
-                                    parse_mode="Markdown")
-
-
-@authorized
-async def cmd_snooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/snooze <id> <15m|2h|24h> — silence one alert. /unsnooze <id> to undo."""
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text("Usage: `/snooze 3 24h`", parse_mode="Markdown")
-        return
-    try:
-        alert_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("Usage: `/snooze 3 24h`", parse_mode="Markdown")
-        return
-    secs = _parse_duration(args[1])
-    if not secs or not (60 <= secs <= 30 * 86400):
-        await update.message.reply_text("Duration 1m..30d, e.g. `/snooze 3 24h`.", parse_mode="Markdown")
-        return
-    alert = await db.get_alert(alert_id)
-    if not alert:
-        await update.message.reply_text(f"Alert #{alert_id} not found.")
-        return
-    import datetime as _dt
-    until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=secs)).strftime("%Y-%m-%d %H:%M:%S")
-    await db.set_snooze(alert_id, until)
-    await update.message.reply_text(f"Alert #{alert_id} snoozed till {_fmt_ts(until)}.")
-
-
-@authorized
-async def cmd_unsnooze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/unsnooze <id>"""
-    if not context.args:
-        await update.message.reply_text("Usage: `/unsnooze 3`", parse_mode="Markdown")
-        return
-    try:
-        alert_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Usage: `/unsnooze 3`", parse_mode="Markdown")
-        return
-    alert = await db.get_alert(alert_id)
-    if not alert:
-        await update.message.reply_text(f"Alert #{alert_id} not found.")
-        return
-    await db.set_snooze(alert_id, None)
-    await update.message.reply_text(f"Alert #{alert_id} unsnoozed.")
-
-
-@authorized
-async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/pause [15m|2h] — mute all alerts (default PAUSE_DURATION_HOURS)."""
-    engine = context.bot_data["engine"]
-    secs = None
-    if context.args:
-        secs = _parse_duration(context.args[0])
-        if not secs or not (60 <= secs <= 24 * 3600):
-            await update.message.reply_text("Usage: `/pause` or `/pause 15m` / `/pause 2h`.", parse_mode="Markdown")
-            return
-    hours = (secs / 3600) if secs else config.PAUSE_DURATION_HOURS
-    engine.pause_alerts(hours)
-    label = f"{secs // 60}m" if secs and secs < 3600 else f"{hours:g}h"
-    await update.message.reply_text(f"Alerts paused for {label}.", reply_markup=get_main_keyboard(engine))
-
-
-@authorized
-async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    engine = context.bot_data["engine"]
-    engine.resume_alerts()
-    await update.message.reply_text("Alerts resumed.", reply_markup=get_main_keyboard(engine))
-
-
-@authorized
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/movers [n] — top 24h movers by absolute change."""
-    n = 8
-    if context.args:
-        try:
-            n = max(3, min(15, int(context.args[0])))
-        except ValueError:
-            pass
-    rows = await get_top_movers(n)
-    if not rows:
-        await update.message.reply_text("Could not fetch movers right now.")
-        return
-    lines = ["*Top 24h movers*\n"]
-    for symbol, price, pct in rows:
-        coin = _escape_md(symbol.replace("USDT", ""))
-        arrow = "up" if pct >= 0 else "down"
-        lines.append(f"  *{coin}*: {format_price(price)} ({_fmt_pct(pct)} {arrow})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-@authorized
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/history [n] — recently fired alerts."""
-    n = 10
-    if context.args:
-        try:
-            n = max(1, min(30, int(context.args[0])))
-        except ValueError:
-            pass
-    rows = await db.get_fired_history(n)
-    if not rows:
-        await update.message.reply_text("No fired alerts yet.")
-        return
-    lines = ["*Recently fired*\n"]
-    for aid, symbol, condition, target, price, detail, fired_at in rows:
-        coin = _escape_md((symbol or "").replace("USDT", ""))
-        extra = f" {detail}" if detail else ""
-        lines.append(f"  #{aid} *{coin}* {condition} {format_price(target)} @ {format_price(price)}{extra} — {_fmt_ts(fired_at)}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-
-@authorized
-async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/health — watchdog view: reconnects, queue, per-symbol data age."""
-    engine = context.bot_data["engine"]
-    ws = context.bot_data["ws"]
-    import datetime as _dt
-    stats = engine.get_stats() if hasattr(engine, "get_stats") else {}
-    try:
-        expired = await db.prune_expired()
-    except Exception:
-        expired = 0
-    try:
-        pending = await db.pending_count()
-    except Exception:
-        pending = 0
-    lines = [
-        "*Health*",
-        f"WS connected: {'yes' if getattr(ws, 'connected', False) else 'no'}"
-        f"  |  Reconnects: {getattr(ws, 'reconnects', 0)}",
-        f"Checks: {stats.get('checks', 0)}  Triggered: {stats.get('triggered', 0)}"
-        f"  Errors: {stats.get('errors', 0)}",
-        f"Queued notifications: {pending}"
-        + (f"  |  Pruned expired: {expired}" if expired else ""),
-    ]
-    try:
-        now = _dt.datetime.now(_dt.timezone.utc)
-        stale = []
-        for sym, ts in (getattr(engine, "last_update_at", {}) or {}).items():
-            age = (now - ts).total_seconds() if ts else 1e9
-            if age > 300:
-                stale.append(f"{sym.replace('USDT', '')} {int(age // 60)}m")
-        tracked = sorted((getattr(ws, "subscribed_symbols", None) or set()))
-        missing = [s for s in tracked if s not in (getattr(engine, "last_update_at", {}) or {})]
-        for s in missing[:5]:
-            stale.append(f"{s.replace('USDT', '')} never")
-        lines.append(("Stale: " + ", ".join(stale[:8])) if stale else "Streams: fresh")
-    except Exception:
-        pass
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
 @authorized
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle text from interactive buttons or wizard states."""
@@ -1774,8 +1575,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             try:
                 aid = int(aid_str)
                 dur = _parse_duration(dur_str) or 7200
-                until = int(time.time()) + dur
-                await db.snooze_alert(aid, until)
+                until = db.iso_in(seconds=dur)
+                await db.set_snooze(aid, until)
                 await query.answer(f"🔕 Alert #{aid} snoozed for {dur_str}")
                 try:
                     await query.edit_message_reply_markup(reply_markup=None)

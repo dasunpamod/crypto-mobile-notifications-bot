@@ -105,16 +105,28 @@ async def flush_pending(telegram_bot=None, chat_id: int | None = None) -> int:
                 pass
             # ntfy down → Telegram fallback so nothing is silently lost.
             if telegram_bot and chat_id and symbol:
+                coin_safe = _escape_markdown(symbol.replace('USDT', ''))
+                safe_msg = _escape_markdown(message)
                 try:
                     await telegram_bot.send_message(
                         chat_id=chat_id,
-                        text=f"*{_escape_markdown(symbol.replace('USDT', ''))}* queued alert:\n{message}",
+                        text=f"*{coin_safe}* queued alert:\n{safe_msg}",
                         parse_mode="Markdown",
                     )
                     await db.ack_notification(nid)
                     delivered += 1
                 except Exception as e:
-                    logger.error(f"Failed Telegram fallback for queued #{nid}: {e}")
+                    logger.warning(f"Markdown fallback failed, trying plain text: {e}")
+                    try:
+                        await telegram_bot.send_message(
+                            chat_id=chat_id,
+                            text=f"{symbol.replace('USDT', '')} queued alert:\n{message}",
+                            parse_mode=None,
+                        )
+                        await db.ack_notification(nid)
+                        delivered += 1
+                    except Exception as inner_e:
+                        logger.error(f"Failed Telegram fallback for queued #{nid}: {inner_e}")
     if delivered:
         logger.info(f"Flushed {delivered} queued notification(s)")
     return delivered
@@ -131,7 +143,7 @@ async def post_webhook(payload: dict) -> bool:
         resp.raise_for_status()
         return True
     except Exception as e:
-        logger.error(f"Webhook POST failed: {e}")
+        logger.error(f"Webhook POST failed: {type(e).__name__}")
         return False
 
 
@@ -143,7 +155,7 @@ async def ping_healthcheck() -> None:
         client = await _get_client()
         await client.get(url, timeout=10.0)
     except Exception as e:
-        logger.warning(f"Healthcheck ping failed: {e}")
+        logger.warning(f"Healthcheck ping failed: {type(e).__name__}")
 
 
 async def send_alert_notification(

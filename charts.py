@@ -151,13 +151,15 @@ async def generate_chart_image(symbol: str, interval: str = "1h", limit: int = 3
     close_prices = [c["close"] for c in candles]
     latest_price = close_prices[-1]
     first_price = close_prices[0]
-    pct_change = ((latest_price - first_price) / first_price) * 100
+    pct_change = ((latest_price - first_price) / first_price * 100) if first_price > 0 else 0.0
 
     is_bullish = latest_price >= first_price
     theme_color = "#26A69A" if is_bullish else "#EF5350"
     fill_color = "rgba(38, 166, 154, 0.15)" if is_bullish else "rgba(239, 83, 80, 0.15)"
 
-    title = f"{symbol} ({interval.upper()})  |  ${latest_price:,.2f} ({pct_change:+.2f}%)"
+    from prices import format_price
+    price_str = format_price(latest_price)
+    title = f"{symbol} ({interval.upper()})  |  {price_str} ({pct_change:+.2f}%)"
 
     chart_config = {
         "type": "line",
