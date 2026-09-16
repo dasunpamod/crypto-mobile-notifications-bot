@@ -87,14 +87,21 @@ async def close_price_client() -> None:
         _client = None
 
 
-def register_live_price(symbol: str, price: float) -> None:
+def register_live_price(symbol: str, price: float, pct_change: float | str | None = None) -> None:
     """Seed or update cache from live WebSocket ticks (never geo-blocked)."""
     symbol = (symbol or "").strip().upper()
     if not symbol or not (price > 0):
         return
     now = time.monotonic()
     existing = _cache.get(symbol)
-    pct = existing[0].get("price24hPcnt") if existing else None
+    if pct_change is not None:
+        try:
+            pct = str(float(pct_change))
+        except (TypeError, ValueError):
+            pct = existing[0].get("price24hPcnt") if existing else None
+    else:
+        pct = existing[0].get("price24hPcnt") if existing else None
+
     ticker = {
         "symbol": symbol,
         "lastPrice": str(price),
@@ -164,8 +171,31 @@ async def _fetch_from_gateio(client: httpx.AsyncClient, symbol: str) -> dict | N
     return None
 
 
+async def _fetch_from_coinbase(client: httpx.AsyncClient, symbol: str) -> dict | None:
+    """Fallback to Coinbase Pro API (US-compliant, rock-solid for SOL, BTC, ETH on US cloud VMs)."""
+    try:
+        base = symbol.replace("USDT", "").replace("USDC", "").replace("USD", "")
+        if not base:
+            return None
+        resp = await client.get(
+            f"https://api.exchange.coinbase.com/products/{base}-USD/ticker"
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            price = float(data.get("price") or 0)
+            if price > 0:
+                return {
+                    "symbol": symbol,
+                    "lastPrice": str(price),
+                    "price24hPcnt": None,
+                }
+    except Exception as e:
+        logger.debug(f"Coinbase ticker error for {symbol}: {e}")
+    return None
+
+
 async def get_ticker(symbol: str):
-    """Fetch ticker dict for a symbol (cached). Falls back to Binance.US/Gate.io if Bybit is geo-blocked."""
+    """Fetch ticker dict for a symbol (cached). Falls back to Binance.US/Gate.io/Coinbase if Bybit is geo-blocked."""
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return None
@@ -187,6 +217,10 @@ async def get_ticker(symbol: str):
     # 3. Fallback to Gate.io (for coins not on Binance.US)
     if not ticker:
         ticker = await _fetch_from_gateio(client, symbol)
+
+    # 4. Fallback to Coinbase (US-compliant, rock-solid for SOL, BTC, ETH)
+    if not ticker:
+        ticker = await _fetch_from_coinbase(client, symbol)
 
     if ticker:
         _prune_cache()
@@ -221,14 +255,16 @@ def ticker_change_24h(ticker) -> float | None:
         return None
 
 
-def cached_price(symbol: str) -> float | None:
-    """Return the last known price from cache without any network I/O."""
+def cached_price(symbol: str, max_age_sec: float | None = None) -> float | None:
+    """Return the price from cache without any network I/O if within TTL."""
     entry = _cache.get((symbol or "").upper())
     if not entry:
         return None
-    if (time.monotonic() - entry[1]) < _ttl():
+    age = time.monotonic() - entry[1]
+    limit = max_age_sec if max_age_sec is not None else _ttl()
+    if age <= limit:
         return ticker_price(entry[0])
-    return ticker_price(entry[0])
+    return None
 
 
 async def get_current_price(symbol: str) -> float | None:

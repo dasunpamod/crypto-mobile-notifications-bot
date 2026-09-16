@@ -120,11 +120,12 @@ async def _send_all_prices(target, engine, context=None, prefix="*Prices*\n") ->
     lines = [prefix]
     for symbol in symbols:
         coin = _escape_md(symbol.replace("USDT", ""))
-        cached = engine.last_prices.get(symbol) if engine else None
         ticker = tickers.get(symbol)
-        price = cached if cached is not None else ticker_price(ticker)
+        price = ticker_price(ticker)
+        if price is None and engine:
+            price = engine.get_fresh_price(symbol, max_age_sec=30)
         if price is None:
-            price = cached_price(symbol)
+            price = cached_price(symbol, max_age_sec=120)
         if price is None:
             lines.append(f"  *{coin}*: unavailable")
             continue
@@ -187,7 +188,7 @@ async def _resolve_symbol(coin_or_symbol: str, engine=None) -> tuple | None:
         return None
     price = await get_current_price(symbol)
     if price is None and engine is not None:
-        price = engine.last_prices.get(symbol)
+        price = engine.get_fresh_price(symbol, max_age_sec=30)
     return symbol, price
 
 
@@ -265,9 +266,12 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
     symbols = sorted({a[1] for a in chunk})
     tickers = await get_tickers(symbols)
     for symbol in symbols:
-        price = engine.last_prices.get(symbol) or ticker_price(tickers.get(symbol))
+        ticker = tickers.get(symbol)
+        price = ticker_price(ticker)
+        if price is None and engine:
+            price = engine.get_fresh_price(symbol, max_age_sec=30)
         if price is None:
-            price = cached_price(symbol)
+            price = cached_price(symbol, max_age_sec=120)
         if price is None:
             price = await get_current_price(symbol)
         if price is not None:
@@ -513,10 +517,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(f"Invalid symbol `{_escape_md(symbol)}`.", parse_mode="Markdown")
             return
         symbol, current_price = resolved
-        if current_price is None:
-            current_price = engine.last_prices.get(symbol)
-        if current_price is not None:
-            engine.last_prices[symbol] = current_price
+        if current_price is None and engine is not None:
+            current_price = engine.get_fresh_price(symbol, max_age_sec=30)
 
         if is_trail or is_move or is_funding:
             arg = ""
@@ -645,8 +647,10 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         symbol = symbols[0]
         ticker = await get_ticker(symbol)
         price = ticker_price(ticker)
+        if price is None and engine:
+            price = engine.get_fresh_price(symbol, max_age_sec=30)
         if price is None:
-            price = engine.last_prices.get(symbol)
+            price = cached_price(symbol, max_age_sec=120)
         coin = _escape_md(symbol.replace("USDT", ""))
         if price:
             extra = ""
@@ -661,7 +665,12 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["*Prices*\n"]
     for symbol in symbols:
         coin = _escape_md(symbol.replace("USDT", ""))
-        price = engine.last_prices.get(symbol) or ticker_price(tickers.get(symbol))
+        ticker = tickers.get(symbol)
+        price = ticker_price(ticker)
+        if price is None and engine:
+            price = engine.get_fresh_price(symbol, max_age_sec=30)
+        if price is None:
+            price = cached_price(symbol, max_age_sec=120)
         if price is None:
             lines.append(f"  *{coin}*: unavailable")
             continue
@@ -713,9 +722,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if symbols:
         tickers = await get_tickers(symbols[:10])
         for s in symbols[:10]:
-            p = engine.last_prices.get(s) or ticker_price(tickers.get(s))
+            ticker = tickers.get(s)
+            p = ticker_price(ticker)
+            if p is None and engine:
+                p = engine.get_fresh_price(s, max_age_sec=30)
             if p is None:
-                p = cached_price(s)
+                p = cached_price(s, max_age_sec=120)
             extra = ""
             pct = ticker_change_24h(tickers.get(s) or cached_ticker(s))
             if pct is not None:
@@ -1050,7 +1062,6 @@ async def cmd_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         target = price * (1 + pct / 100) if direction == "above" else price * (1 - pct / 100)
         aid = await db.add_alert(symbol, target, direction, True, alert_type="price")
         await ws.subscribe(symbol)
-        engine.last_prices[symbol] = price
         made.append(f"#{aid} {symbol.replace('USDT', '')} {direction} {format_price(target)}")
     if not made:
         await update.message.reply_text("Could not fetch prices for the preset.")
@@ -1114,8 +1125,10 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 skipped += 1
                 continue
             price = await get_current_price(symbol)
+            if price is None and engine:
+                price = engine.get_fresh_price(symbol, max_age_sec=30)
             if price is None:
-                price = engine.last_prices.get(symbol) or target
+                price = target
             atype = str(item.get("alert_type", "price") or "price")
             if atype not in ("price", "pct", "trail", "move", "funding"):
                 atype = "price"
@@ -1128,7 +1141,6 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 peak_price=item.get("peak_price") or price,
                 funding_rate=item.get("funding_rate"))
             await ws.subscribe(symbol)
-            engine.last_prices[symbol] = price
             made += 1
         except Exception:
             skipped += 1
@@ -1282,10 +1294,8 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Invalid coin `{_escape_md(symbol)}`.", parse_mode="Markdown")
         return
     symbol, current_price = resolved
-    if current_price is None:
-        current_price = engine.last_prices.get(symbol)
-    if current_price is not None:
-        engine.last_prices[symbol] = current_price
+    if current_price is None and engine is not None:
+        current_price = engine.get_fresh_price(symbol, max_age_sec=30)
 
     step = (high - low) / (count - 1)
     grid_prices = [low + i * step for i in range(count)]
@@ -1571,8 +1581,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text(f"Invalid coin `{_escape_md(awaiting_coin)}`. Wizard cancelled.", parse_mode="Markdown")
                 return
             symbol, price = resolved
-            if price is None:
-                price = engine.last_prices.get(symbol)
+            if price is None and engine is not None:
+                price = engine.get_fresh_price(symbol, max_age_sec=30)
 
             if await db.count_alerts() + len(targets) > _max_alerts():
                 context.user_data.pop("awaiting_custom_price", None)
@@ -1927,8 +1937,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     pass
                 return
             price = await get_current_price(symbol)
-            if not price:
-                price = engine.last_prices.get(symbol)
+            if not price and engine is not None:
+                price = engine.get_fresh_price(symbol, max_age_sec=30)
             if not price:
                 try:
                     await query.edit_message_text("Could not fetch current price to calculate percentage.")

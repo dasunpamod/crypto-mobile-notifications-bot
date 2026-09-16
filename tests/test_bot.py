@@ -182,6 +182,21 @@ class TestAlertEngine(unittest.TestCase):
                 os.unlink(tmp.name)
         _run(go())
 
+    def test_get_fresh_price_staleness(self):
+        async def go():
+            from alert_engine import AlertEngine
+            import datetime
+            engine = AlertEngine()
+            await engine.on_price_update("SOLUSDT", 98.50)
+            self.assertEqual(engine.get_fresh_price("SOLUSDT", max_age_sec=30), 98.50)
+
+            # Manually age the update timestamp to simulate stale cache
+            engine.last_update_at["SOLUSDT"] = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)
+            self.assertIsNone(engine.get_fresh_price("SOLUSDT", max_age_sec=30))
+            self.assertEqual(engine.get_fresh_price("SOLUSDT", max_age_sec=120), 98.50)
+            self.assertIsNone(engine.get_fresh_price("NONEXISTENT"))
+        _run(go())
+
     def test_move_alert_fires_on_rapid_move(self):
         async def go():
             import database as db
@@ -509,6 +524,33 @@ class TestPricesCache(unittest.TestCase):
         self.assertGreater(len(prices._cache), 500)
         prices._prune_cache()
         self.assertLessEqual(len(prices._cache), 500)
+
+    def test_cached_price_ttl_expiry(self):
+        import prices
+        import time
+        # Seed cache with a fresh entry
+        prices._cache["FRESH"] = ({"lastPrice": "50.0"}, time.monotonic())
+        self.assertEqual(prices.cached_price("FRESH"), 50.0)
+
+        # Seed cache with an ancient entry
+        prices._cache["STALE"] = ({"lastPrice": "50.0"}, time.monotonic() - 100)
+        self.assertIsNone(prices.cached_price("STALE"))
+        self.assertEqual(prices.cached_price("STALE", max_age_sec=200), 50.0)
+
+    def test_coinbase_fallback(self):
+        async def go():
+            import prices
+            from unittest.mock import AsyncMock, MagicMock
+            mock_client = MagicMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {"price": "98.75"}
+            mock_client.get = AsyncMock(return_value=mock_resp)
+
+            result = await prices._fetch_from_coinbase(mock_client, "SOLUSDT")
+            self.assertIsNotNone(result)
+            self.assertEqual(result["lastPrice"], "98.75")
+        _run(go())
 
 
 class TestWebSocketGuards(unittest.TestCase):

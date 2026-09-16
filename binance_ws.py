@@ -163,6 +163,10 @@ class BybitWebSocket:
                             data = json.loads(message)
                             if not isinstance(data, dict):
                                 continue
+                            if data.get("op") == "subscribe":
+                                if not data.get("success", False):
+                                    logger.warning(f"Bybit WS subscription error: {data.get('ret_msg')}")
+                                continue
                             if data.get("op") == "pong" or "topic" not in data:
                                 continue
                             topic = data.get("topic", "")
@@ -181,6 +185,7 @@ class BybitWebSocket:
                                 continue
                             if not (price > 0 and price == price and price != float("inf")):
                                 continue
+                            pct_str = payload.get("price24hPcnt")
                             async with self._lock:
                                 if symbol in self.subscribed_symbols:
                                     self.last_tick_at[symbol] = time.monotonic()
@@ -188,6 +193,8 @@ class BybitWebSocket:
                                 else:
                                     continue
                             try:
+                                await self.on_price_update(symbol, price, pct_str)
+                            except TypeError:
                                 await self.on_price_update(symbol, price)
                             except Exception as e:
                                 logger.error(f"on_price_update failed for {symbol}: {e}")

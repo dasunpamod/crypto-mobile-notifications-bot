@@ -60,6 +60,20 @@ class AlertEngine:
         self.started_at = datetime.datetime.now(datetime.timezone.utc)
         self._last_prune_ts: float = 0.0
 
+    def get_fresh_price(self, symbol: str, max_age_sec: float = 30.0) -> float | None:
+        """Return the live WebSocket price only if it was updated within max_age_sec."""
+        symbol = (symbol or "").strip().upper()
+        p = self.last_prices.get(symbol)
+        if p is None:
+            return None
+        updated = self.last_update_at.get(symbol)
+        if not updated:
+            return None
+        age = (datetime.datetime.now(datetime.timezone.utc) - updated).total_seconds()
+        if age <= max_age_sec:
+            return p
+        return None
+
     def pause_alerts(self, hours: int) -> None:
         self.mute_until = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=hours)
         
@@ -180,13 +194,13 @@ class AlertEngine:
             self._stats["errors"] += 1
             logger.error(f"Error in on_funding_update({symbol}): {e}", exc_info=True)
 
-    async def on_price_update(self, symbol: str, price: float) -> None:
+    async def on_price_update(self, symbol: str, price: float, pct: float | str | None = None) -> None:
         """Called on every price tick from the WebSocket."""
         try:
             if not (price > 0 and price == price and price != float("inf")):
                 return
             symbol = symbol.upper()
-            register_live_price(symbol, price)
+            register_live_price(symbol, price, pct_change=pct)
             now = datetime.datetime.now(datetime.timezone.utc)
 
             if self.is_muted():
@@ -313,6 +327,8 @@ class AlertEngine:
                         remaining = await db.get_alerts_for_symbol(symbol)
                         if not remaining:
                             await self.binance_ws.unsubscribe(symbol)
+                            self.last_prices.pop(symbol, None)
+                            self.last_update_at.pop(symbol, None)
                             logger.info(f"No remaining alerts for {symbol} — unsubscribed")
                     except Exception as e:
                         logger.error(f"Error unsubscribing {symbol}: {e}")
