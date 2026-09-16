@@ -565,6 +565,12 @@ class TestWebSocketGuards(unittest.TestCase):
             self.assertNotIn("BTCUSDT", ws.subscribed_symbols)
         _run(go())
 
+    def test_startup_symbols_combination(self):
+        alert_symbols = {"BTCUSDT", "ETHUSDT"}  # get_active_symbols returns a set
+        watchlist_symbols = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT")  # tuple
+        all_symbols = sorted(set(alert_symbols) | set(watchlist_symbols))
+        self.assertEqual(all_symbols, ["BTCUSDT", "ETHUSDT", "HYPEUSDT", "SOLUSDT"])
+
 
 class TestNewPowerFeatures(unittest.TestCase):
     def test_heartbeat_task(self):

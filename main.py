@@ -186,8 +186,8 @@ async def main() -> None:
 
     # ── Load existing alerts + watchlist and subscribe to their symbols ──
     alert_symbols = await get_active_symbols()
-    watchlist_symbols = list(config.WATCHLIST_SYMBOLS or ("BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"))
-    all_symbols = sorted(set(alert_symbols + watchlist_symbols))
+    watchlist_symbols = config.WATCHLIST_SYMBOLS or ("BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT")
+    all_symbols = sorted(set(alert_symbols) | set(watchlist_symbols))
     for symbol in all_symbols:
         await ws.subscribe(symbol)
     logger.info(f"Subscribed to {len(all_symbols)} symbol(s) ({len(alert_symbols)} alerts, {len(watchlist_symbols)} watchlist)")
