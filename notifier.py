@@ -43,8 +43,9 @@ def _escape_markdown(text: str) -> str:
 async def send_ntfy(
     title: str,
     message: str,
-    tags: str | None = None,
+    tags: str | list | None = None,
     priority: str = "high",
+    sound: str | None = None,
 ) -> bool:
     """Send a push notification via ntfy.sh. Returns True on success."""
     if not NTFY_TOPIC:
@@ -59,7 +60,9 @@ async def send_ntfy(
         "priority": prio,
     }
     if tags:
-        payload["tags"] = [tags]
+        payload["tags"] = [tags] if isinstance(tags, str) else list(tags)
+    if sound:
+        payload["sound"] = sound
 
     headers = {}
     if config.NTFY_TOKEN:
@@ -153,18 +156,21 @@ async def send_alert_notification(
     priority: str = "high",
     detail: str = "",
     alert_id: int | None = None,
+    is_urgent: bool = False,
 ) -> None:
     """Send an alert notification via ntfy (and optionally Telegram)."""
     coin = symbol.replace("USDT", "")
     coin_safe = _escape_markdown(coin)
     direction = "above" if condition == "above" else "below"
-    emoji = "\U0001f4c8" if condition == "above" else "\U0001f4c9"
-    tag = "chart_with_upwards_trend" if condition == "above" else "chart_with_downwards_trend"
+    emoji = "🚨" if is_urgent else ("\U0001f4c8" if condition == "above" else "\U0001f4c9")
+    tag = ["rotating_light", "warning"] if is_urgent else ("chart_with_upwards_trend" if condition == "above" else "chart_with_downwards_trend")
+    sound = "siren" if is_urgent else None
+    effective_priority = "max" if is_urgent else priority
 
     target_str = format_price(target)
     curr_str = format_price(current_price)
 
-    title = f"{emoji} {coin} Alert Triggered"
+    title = f"{'🚨 [EMERGENCY] ' if is_urgent else ''}{emoji} {coin} Alert Triggered"
     message = (
         f"{coin} crossed {direction} {target_str}\n"
         f"Current price: {curr_str}"
@@ -172,11 +178,12 @@ async def send_alert_notification(
     if detail:
         message += f"\n{detail}"
 
-    ntfy_ok = await send_ntfy(title, message, tags=tag, priority=priority)
+    tag_str = ",".join(tag) if isinstance(tag, list) else (tag or "")
+    ntfy_ok = await send_ntfy(title, message, tags=tag, priority=effective_priority, sound=sound)
     if not ntfy_ok:
         # Queue for retry — flushed hourly and on startup.
         try:
-            await db.queue_notification(title, message, tags=tag, priority=priority, symbol=symbol)
+            await db.queue_notification(title, message, tags=tag_str, priority=effective_priority, symbol=symbol)
         except Exception as e:
             logger.error(f"Failed to queue notification: {e}")
 
@@ -185,12 +192,15 @@ async def send_alert_notification(
         await post_webhook({
             "alert_id": alert_id, "symbol": symbol, "condition": condition,
             "target": target, "price": current_price, "detail": detail or "",
+            "is_urgent": is_urgent,
         })
     except Exception:
         pass
 
+    urgent_banner = "🚨🚨 *CRITICAL EMERGENCY ALERT* 🚨🚨\n\n" if is_urgent else ""
     detail_line = f"\n{_escape_markdown(detail)}" if detail else ""
     telegram_text = (
+        f"{urgent_banner}"
         f"{emoji} *{coin_safe} Alert Triggered*\n\n"
         f"{coin_safe} crossed {direction} `{target_str}`\n"
         f"Current price: `{curr_str}`"
@@ -211,6 +221,7 @@ async def send_alert_notification(
                 [
                     InlineKeyboardButton("🔕 Snooze 2h", callback_data=f"quick_snooze_{alert_id}_2h"),
                     InlineKeyboardButton("❌ Remove", callback_data=f"quick_del_{alert_id}"),
+                    InlineKeyboardButton("📊 Chart", callback_data=f"chart_{symbol}"),
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(kb)

@@ -132,6 +132,7 @@ async def init_db() -> None:
         ("base_price", "ALTER TABLE alerts ADD COLUMN base_price REAL"),
         ("peak_price", "ALTER TABLE alerts ADD COLUMN peak_price REAL"),
         ("funding_rate", "ALTER TABLE alerts ADD COLUMN funding_rate REAL"),
+        ("is_urgent", "ALTER TABLE alerts ADD COLUMN is_urgent INTEGER DEFAULT 0"),
     ):
         if col not in columns:
             await db.execute(ddl)
@@ -151,6 +152,7 @@ def _colmap() -> dict:
         "is_persistent": 5, "last_triggered_at": 6, "alert_type": 7,
         "expires_at": 8, "snoozed_until": 9, "cooldown_sec": 10, "pct": 11,
         "window_min": 12, "base_price": 13, "peak_price": 14, "funding_rate": 15,
+        "is_urgent": 16,
     }
 
 
@@ -166,7 +168,7 @@ def alert_field(row, name: str, default=None):
 async def add_alert(symbol: str, target: float, condition: str, is_persistent: bool = False,
                     alert_type: str = "price", expires_at=None, cooldown_sec=None,
                     pct=None, window_min=None, base_price=None, peak_price=None,
-                    funding_rate=None) -> int:
+                    funding_rate=None, is_urgent: bool = False) -> int:
     """Add a new alert. Returns the alert ID."""
     symbol = normalize_symbol(symbol)
     if not is_valid_symbol(symbol):
@@ -183,10 +185,11 @@ async def add_alert(symbol: str, target: float, condition: str, is_persistent: b
     cursor = await db.execute(
         """INSERT INTO alerts (symbol, target, condition, is_persistent, alert_type,
                                expires_at, cooldown_sec, pct, window_min,
-                               base_price, peak_price, funding_rate)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               base_price, peak_price, funding_rate, is_urgent)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (symbol, target, condition, 1 if is_persistent else 0, alert_type,
-         expires_at, cooldown_sec, pct, window_min, base_price, peak_price, funding_rate),
+         expires_at, cooldown_sec, pct, window_min, base_price, peak_price, funding_rate,
+         1 if is_urgent else 0),
     )
     await db.commit()
     alert_id = cursor.lastrowid

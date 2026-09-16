@@ -111,8 +111,11 @@ class AlertEngine:
         condition = db.alert_field(alert, "condition", "above")
         is_persistent = bool(db.alert_field(alert, "is_persistent", 0))
         alert_type = db.alert_field(alert, "alert_type", "price") or "price"
+        is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
         self._stats["triggered"] += 1
         tag = " [REPEAT]" if is_persistent else ""
+        if is_urgent:
+            tag += " [URGENT]"
         logger.info(
             f"Alert #{alert_id}{tag} [{alert_type}] triggered: {symbol} "
             f"{condition} {format_price(target)} (current: {format_price(price)}) {detail}".rstrip()
@@ -121,7 +124,7 @@ class AlertEngine:
             symbol=symbol, condition=condition, target=target,
             current_price=price, telegram_bot=self.telegram_bot,
             chat_id=self.chat_id, priority=self._priority(is_persistent),
-            detail=detail, alert_id=alert_id,
+            detail=detail, alert_id=alert_id, is_urgent=is_urgent,
         )
         try:
             await db.log_fired(alert_id, symbol, condition, target, price, detail)

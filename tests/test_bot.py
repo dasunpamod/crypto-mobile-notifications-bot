@@ -627,8 +627,167 @@ class TestNewPowerFeatures(unittest.TestCase):
                 self.assertIn("quick_add_BTCUSDT_below_", buttons[0][1].callback_data)
                 self.assertEqual(buttons[1][0].callback_data, "quick_snooze_42_2h")
                 self.assertEqual(buttons[1][1].callback_data, "quick_del_42")
+                self.assertEqual(buttons[1][2].callback_data, "chart_BTCUSDT")
             finally:
                 notifier.SEND_TELEGRAM_ALERTS = old_send
+        _run(go())
+
+
+class TestUrgentAlerts(unittest.TestCase):
+    def test_db_urgent_flag(self):
+        async def go():
+            import database as db
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                aid = await db.add_alert("BTCUSDT", 70000, "above", is_urgent=True)
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_urgent"), 1)
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_urgent_notification_delivery(self):
+        async def go():
+            import notifier
+            from unittest.mock import AsyncMock, MagicMock, patch
+            mock_bot = MagicMock()
+            mock_bot.send_message = AsyncMock()
+            old_send = notifier.SEND_TELEGRAM_ALERTS
+            notifier.SEND_TELEGRAM_ALERTS = True
+            with patch("notifier.send_ntfy", new_callable=AsyncMock) as mock_ntfy:
+                mock_ntfy.return_value = True
+                try:
+                    await notifier.send_alert_notification(
+                        symbol="BTCUSDT",
+                        condition="above",
+                        target=70000,
+                        current_price=70100,
+                        telegram_bot=mock_bot,
+                        chat_id=123,
+                        is_urgent=True
+                    )
+                    # Verify ntfy params
+                    self.assertTrue(mock_ntfy.called)
+                    call_kwargs = mock_ntfy.call_args[1]
+                    self.assertEqual(call_kwargs.get("priority"), "max")
+                    self.assertEqual(call_kwargs.get("sound"), "siren")
+                    # Verify telegram message
+                    self.assertTrue(mock_bot.send_message.called)
+                    tg_text = mock_bot.send_message.call_args[1]["text"]
+                    self.assertIn("CRITICAL EMERGENCY ALERT", tg_text)
+                finally:
+                    notifier.SEND_TELEGRAM_ALERTS = old_send
+        _run(go())
+
+
+class TestCharts(unittest.TestCase):
+    def test_fear_and_greed_mock(self):
+        async def go():
+            import charts
+            from unittest.mock import AsyncMock, patch, MagicMock
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "data": [{"value": "78", "value_classification": "Extreme Greed"}]
+            }
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                mock_get.return_value = mock_resp
+                res = await charts.get_fear_and_greed()
+                self.assertIsNotNone(res)
+                self.assertEqual(res["value"], 78)
+                self.assertEqual(res["classification"], "Extreme Greed")
+        _run(go())
+
+    def test_fetch_klines_mock(self):
+        async def go():
+            import charts
+            from unittest.mock import AsyncMock, patch, MagicMock
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "result": {
+                    "list": [
+                        ["1700003600000", "98.0", "99.0", "97.5", "98.5", "100", "9850"],
+                        ["1700000000000", "97.0", "98.2", "96.5", "98.0", "90", "8820"],
+                    ]
+                }
+            }
+            with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+                mock_get.return_value = mock_resp
+                candles = await charts.fetch_klines("SOLUSDT", interval="1h", limit=10)
+                self.assertIsNotNone(candles)
+                self.assertEqual(len(candles), 2)
+                self.assertEqual(candles[0]["open"], 97.0)
+                self.assertEqual(candles[1]["close"], 98.5)
+        _run(go())
+
+
+class TestWebhookServer(unittest.TestCase):
+    def test_http_request_parsing(self):
+        from webhook_server import _parse_http_request
+        raw = b"POST /webhook/secret123 HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{\"symbol\":\"SOL\",\"price\":150}"
+        method, path, headers, body = _parse_http_request(raw)
+        self.assertEqual(method, "POST")
+        self.assertEqual(path, "/webhook/secret123")
+        self.assertEqual(headers.get("content-type"), "application/json")
+        self.assertIn("\"symbol\":\"SOL\"", body)
+
+    def test_webhook_server_endpoints(self):
+        async def go():
+            import webhook_server
+            import config
+            import httpx
+            from unittest.mock import AsyncMock, patch, MagicMock
+
+            old_secret = config.WEBHOOK_SECRET
+            old_port = config.WEBHOOK_PORT
+            test_port = 19123
+            config.WEBHOOK_SECRET = "supersecret"
+            config.WEBHOOK_PORT = test_port
+
+            mock_bot = MagicMock()
+            mock_bot.send_message = AsyncMock()
+
+            server_task = asyncio.create_task(webhook_server.run_webhook_server(telegram_bot=mock_bot))
+            await asyncio.sleep(0.1)
+
+            try:
+                async with httpx.AsyncClient(trust_env=False, timeout=3.0) as client:
+                    # 1. Health ping
+                    r = await client.get(f"http://127.0.0.1:{test_port}/health")
+                    self.assertEqual(r.status_code, 200)
+                    self.assertEqual(r.json(), {"status": "ok"})
+
+                    # 2. Unauthorized webhook (no secret)
+                    r = await client.post(f"http://127.0.0.1:{test_port}/webhook", json={"test": 1})
+                    self.assertEqual(r.status_code, 401)
+
+                    # 3. Authorized webhook via URL path
+                    with patch("webhook_server.send_ntfy", new_callable=AsyncMock) as mock_ntfy:
+                        mock_ntfy.return_value = True
+                        r = await client.post(
+                            f"http://127.0.0.1:{test_port}/webhook/supersecret",
+                            json={"symbol": "BTC", "action": "BUY", "price": "75000", "message": "Golden Cross"}
+                        )
+                        self.assertEqual(r.status_code, 200)
+                        self.assertEqual(r.json().get("status"), "ok")
+                        self.assertTrue(mock_ntfy.called)
+            finally:
+                webhook_server.stop_webhook_server()
+                server_task.cancel()
+                try:
+                    await server_task
+                except asyncio.CancelledError:
+                    pass
+                config.WEBHOOK_SECRET = old_secret
+                config.WEBHOOK_PORT = old_port
+
         _run(go())
 
 

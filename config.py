@@ -170,6 +170,11 @@ def now_local():
 # Outgoing webhook called on every trigger (JSON POST). Empty = off.
 WEBHOOK_URL: str = os.getenv("WEBHOOK_URL", "").strip()
 
+# Incoming webhook listener for TradingView / external alerts. False = off.
+WEBHOOK_ENABLED: bool = _parse_bool("WEBHOOK_ENABLED", False)
+WEBHOOK_PORT: int = _parse_int("WEBHOOK_PORT", 8080, 1024, 65535)
+WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "").strip().strip("'\"")
+
 # Healthcheck ping URL (Uptime Kuma / healthchecks.io). Empty = off.
 HEALTHCHECK_URL: str = os.getenv("HEALTHCHECK_URL", "").strip()
 HEARTBEAT_INTERVAL_SEC: int = _parse_int("HEARTBEAT_INTERVAL_SEC", 300, 10, 86400)

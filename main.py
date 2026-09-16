@@ -14,6 +14,7 @@ from telegram_bot import create_bot, format_price
 from prices import close_price_client, get_prices, get_ticker, ticker_price, get_current_price
 from notifier import close_notifier, flush_pending, ping_healthcheck
 import database as db
+import charts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,8 +65,11 @@ async def daily_briefing_task(app) -> None:
         try:
             await asyncio.sleep(sleep_seconds)
 
+            fng = await charts.get_fear_and_greed()
             prices = await get_prices(symbols)
             lines = ["*Daily Crypto Briefing*\n"]
+            if fng:
+                lines.append(f"🧠 *Market Sentiment:* {fng['value']}/100 ({fng['classification']})\n")
             for symbol in symbols:
                 price = prices.get(symbol)
                 coin = symbol.replace("USDT", "")
@@ -204,6 +208,13 @@ async def main() -> None:
     funding_task = asyncio.create_task(funding_poller_task(engine))
     heartbeat_task_handle = asyncio.create_task(heartbeat_task())
 
+    # ── Start Webhook receiver if enabled ────────────────────────────────
+    webhook_task = None
+    if config.WEBHOOK_ENABLED:
+        from webhook_server import run_webhook_server
+        webhook_task = asyncio.create_task(run_webhook_server(telegram_bot=app.bot))
+        logger.info(f"Webhook receiver started on port {config.WEBHOOK_PORT or 8080}")
+
     # ── Graceful shutdown on SIGINT/SIGTERM ───────────────────────────────
     stop_event = asyncio.Event()
 
@@ -245,8 +256,13 @@ async def main() -> None:
         briefing_task.cancel()
         maintenance_task_handle.cancel()
         funding_task.cancel()
-        heartbeat_task_handle.cancel()
-        for bg in (ws_task, briefing_task, maintenance_task_handle, funding_task, heartbeat_task_handle):
+        bg_tasks = [ws_task, briefing_task, maintenance_task_handle, funding_task, heartbeat_task_handle]
+        if webhook_task:
+            from webhook_server import stop_webhook_server
+            stop_webhook_server()
+            webhook_task.cancel()
+            bg_tasks.append(webhook_task)
+        for bg in bg_tasks:
             try:
                 await bg
             except asyncio.CancelledError:

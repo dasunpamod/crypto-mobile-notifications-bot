@@ -10,6 +10,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import database as db
 import config
+import charts
 from config import TELEGRAM_BOT_TOKEN
 from prices import (
     get_current_price, get_prices, get_ticker, get_tickers, get_top_movers,
@@ -248,7 +249,10 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
             desc = f"{pct}% {'in ' + str(window_min) + 'm' if atype == 'move' else ''}".strip()
         else:
             desc = f"{condition} *{format_price(target)}*"
+        is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
         flags = []
+        if is_urgent:
+            flags.append("🚨 URGENT")
         if is_persistent or atype in ("pct", "trail", "move"):
             flags.append("repeat")
         if snoozed:
@@ -298,7 +302,8 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
 
 async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
                             is_move, is_funding, is_persistent, expires_at,
-                            cooldown_sec, window_min=None, single_coin_multi=False):
+                            cooldown_sec, window_min=None, single_coin_multi=False,
+                            is_urgent: bool = False):
     """Create a single alert row. Returns (id, description)."""
     if is_trail:
         pct = float(arg.rstrip("%"))
@@ -307,7 +312,7 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
         aid = await db.add_alert(symbol, current_price, "below", True,
                                  alert_type="trail", pct=pct, base_price=current_price,
                                  peak_price=current_price, expires_at=expires_at,
-                                 cooldown_sec=cooldown_sec)
+                                 cooldown_sec=cooldown_sec, is_urgent=is_urgent)
         return aid, f"trail {pct:g}%"
     if is_move:
         pct = float(arg.rstrip("%"))
@@ -318,7 +323,8 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
         aid = await db.add_alert(symbol, current_price, condition, True,
                                  alert_type="move", pct=pct, window_min=window_min,
                                  base_price=current_price, peak_price=current_price,
-                                 expires_at=expires_at, cooldown_sec=cooldown_sec)
+                                 expires_at=expires_at, cooldown_sec=cooldown_sec,
+                                 is_urgent=is_urgent)
         return aid, f"{pct:g}% in {window_min}m"
     if is_funding:
         pct = float(arg.rstrip("%"))
@@ -328,7 +334,8 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
             condition = "above"
         aid = await db.add_alert(symbol, current_price, condition, True,
                                  alert_type="funding", funding_rate=pct / 100,
-                                 expires_at=expires_at, cooldown_sec=cooldown_sec)
+                                 expires_at=expires_at, cooldown_sec=cooldown_sec,
+                                 is_urgent=is_urgent)
         return aid, f"funding {pct:g}%"
     if arg.endswith("%"):
         percent = float(arg.rstrip("%"))
@@ -344,7 +351,7 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
                 raise RuntimeError("already-hit")
         aid = await db.add_alert(symbol, target, condition, is_persistent,
                                  alert_type="price", expires_at=expires_at,
-                                 cooldown_sec=cooldown_sec)
+                                 cooldown_sec=cooldown_sec, is_urgent=is_urgent)
         return aid, f"{condition} {format_price(target)}"
     target = float(arg.replace(",", ""))
     if not (0 < target <= MAX_PRICE_VALUE):
@@ -365,7 +372,7 @@ async def _create_one_alert(symbol, current_price, condition, arg, is_trail,
             condition = "above"
     aid = await db.add_alert(symbol, target, condition, is_persistent,
                              alert_type="price", expires_at=expires_at,
-                             cooldown_sec=cooldown_sec)
+                             cooldown_sec=cooldown_sec, is_urgent=is_urgent)
     return aid, f"{condition} {format_price(target)}"
 
 
@@ -374,13 +381,14 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/add — price, %, ladder, trail, move, funding. See /help for examples."""
     usage = (
         "Usage:\n"
-        "`/add BTC 72500 above` [repeat] [7d] [cooldown=15m]\n"
+        "`/add BTC 72500 above` [urgent] [repeat] [7d] [cooldown=15m]\n"
         "`/add ETH 5% up repeat`\n"
         "`/add BTC 76000,75000,79000` (auto-detects above/below)\n"
         "`/add BTC,ETH 80000,4000 above` (ladder)\n"
         "`/add BTC trail 5% below`\n"
         "`/add BTC move 3% 60m`\n"
-        "`/add BTC funding 0.01% above`"
+        "`/add BTC funding 0.01% above`\n"
+        "_Add `urgent` or `siren` to sound full siren on phone._"
     )
 
     if not _check_rate_limit(update.effective_user.id):
@@ -466,6 +474,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     is_persistent = "repeat" in rest
+    is_urgent = any(t in rest for t in ("urgent", "siren"))
     expires_at = None
     for token in rest:
         parsed = _parse_expiry(token)
@@ -535,7 +544,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             aid, desc = await _create_one_alert(
                 symbol, current_price, condition, arg, is_trail,
                 is_move, is_funding, is_persistent, expires_at,
-                cooldown_sec, window_min, single_coin_multi=single_coin_multi)
+                cooldown_sec, window_min, single_coin_multi=single_coin_multi,
+                is_urgent=is_urgent)
             await ws.subscribe(symbol)
             created.append((aid, symbol, desc, current_price))
         except RuntimeError:
@@ -556,7 +566,11 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for aid, symbol, desc, now_price in created:
         coin = _escape_md(symbol.replace("USDT", ""))
         lines.append(f"#{aid} *{coin}* {desc} (now {format_price(now_price)})")
-    tag = " [repeat]" if is_persistent or is_trail or is_move else ""
+    tag = ""
+    if is_urgent:
+        tag += " [🚨 URGENT]"
+    if is_persistent or is_trail or is_move:
+        tag += " [repeat]"
     if expires_at:
         tag += f" [expires {_fmt_ts(expires_at)}]"
     await update.message.reply_text(f"Alert(s) created{tag}:\n" + "\n".join(lines), parse_mode="Markdown")
@@ -925,6 +939,60 @@ async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         arrow = "up" if pct >= 0 else "down"
         lines.append(f"  *{coin}*: {format_price(price)} ({_fmt_pct(pct)} {arrow})")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+@authorized
+async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/chart <symbol> [interval] — generate a dark-mode price chart."""
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/chart <symbol> [interval]`\n\n"
+            "Supported intervals: `15m`, `30m`, `1h` (default), `2h`, `4h`, `1d`, `1w`\n"
+            "Example: `/chart BTC 4h`",
+            parse_mode="Markdown"
+        )
+        return
+
+    raw_coin = args[0]
+    symbol = normalize_symbol(raw_coin)
+    if not is_valid_symbol(symbol):
+        await update.message.reply_text(f"Invalid symbol `{_escape_md(raw_coin)}`.", parse_mode="Markdown")
+        return
+
+    interval = args[1].lower() if len(args) > 1 else "1h"
+    valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
+    if interval not in valid_intervals:
+        interval = "1h"
+
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
+    except Exception:
+        pass
+
+    chart_png = await charts.generate_chart_image(symbol, interval=interval)
+    if not chart_png:
+        await update.message.reply_text(
+            f"Failed to generate chart for `{_escape_md(symbol)}`. Please try again in a moment.",
+            parse_mode="Markdown"
+        )
+        return
+
+    coin = symbol.replace("USDT", "")
+    kb = [
+        [
+            InlineKeyboardButton("15m", callback_data=f"chart_{symbol}_15m"),
+            InlineKeyboardButton("1h", callback_data=f"chart_{symbol}_1h"),
+            InlineKeyboardButton("4h", callback_data=f"chart_{symbol}_4h"),
+            InlineKeyboardButton("1d", callback_data=f"chart_{symbol}_1d"),
+        ]
+    ]
+    await update.message.reply_photo(
+        photo=chart_png,
+        caption=f"📊 *{_escape_md(coin)}* ({interval.upper()})",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
 
 
 @authorized
@@ -1742,6 +1810,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await query.answer(f"Error: {e}")
         return
 
+    if data.startswith("chart_"):
+        # chart_<symbol> or chart_<symbol>_<interval>
+        parts = data.split("_")
+        if len(parts) >= 2:
+            sym = normalize_symbol(parts[1])
+            interval = parts[2].lower() if len(parts) >= 3 else "1h"
+            valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
+            if interval not in valid_intervals:
+                interval = "1h"
+            await query.answer("Generating chart...")
+            chart_png = await charts.generate_chart_image(sym, interval=interval)
+            if chart_png:
+                coin = sym.replace("USDT", "")
+                kb = [
+                    [
+                        InlineKeyboardButton("15m", callback_data=f"chart_{sym}_15m"),
+                        InlineKeyboardButton("1h", callback_data=f"chart_{sym}_1h"),
+                        InlineKeyboardButton("4h", callback_data=f"chart_{sym}_4h"),
+                        InlineKeyboardButton("1d", callback_data=f"chart_{sym}_1d"),
+                    ]
+                ]
+                try:
+                    await context.bot.send_photo(
+                        chat_id=query.message.chat_id,
+                        photo=chart_png,
+                        caption=f"📊 *{_escape_md(coin)}* ({interval.upper()})",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup(kb),
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending chart via callback: {e}")
+            else:
+                await query.answer(f"Failed to generate chart for {sym}.", show_alert=True)
+        return
+
     if data.startswith("list_"):
         # list_<page>|<filt>
         try:
@@ -1988,6 +2091,7 @@ async def _post_init(application: Application) -> None:
         BotCommand("list", "View and manage active alerts"),
         BotCommand("price", "Check current crypto prices"),
         BotCommand("movers", "Top 24h market gainers & losers"),
+        BotCommand("chart", "Generate dark-mode price chart (e.g. /chart BTC 1h)"),
         BotCommand("pause", "Temporarily silence all alerts"),
         BotCommand("resume", "Resume alerts immediately"),
         BotCommand("snooze", "Snooze an alert (e.g. /snooze 1 2h)"),
@@ -2038,6 +2142,7 @@ def create_bot(alert_engine, binance_ws) -> Application:
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("movers", cmd_movers))
+    app.add_handler(CommandHandler("chart", cmd_chart))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("unwatch", cmd_unwatch))
