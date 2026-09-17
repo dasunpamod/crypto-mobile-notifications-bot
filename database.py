@@ -239,6 +239,30 @@ async def set_target(alert_id: int, target: float, condition: str) -> None:
     await db.commit()
 
 
+async def toggle_urgent(alert_id: int) -> bool | None:
+    """Toggle is_urgent flag for an alert. Returns the new boolean value, or None if alert not found."""
+    db = await get_db()
+    cursor = await db.execute("SELECT is_urgent FROM alerts WHERE id = ?", (alert_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    if not row:
+        return None
+    new_val = 0 if row[0] else 1
+    await db.execute("UPDATE alerts SET is_urgent = ? WHERE id = ?", (new_val, alert_id))
+    await db.commit()
+    return bool(new_val)
+
+
+async def set_urgent(alert_id: int, is_urgent: bool) -> bool:
+    """Set is_urgent flag for an alert. Returns True if alert was found and updated."""
+    db = await get_db()
+    cursor = await db.execute("UPDATE alerts SET is_urgent = ? WHERE id = ?", (1 if is_urgent else 0, alert_id))
+    await db.commit()
+    updated = cursor.rowcount > 0
+    await cursor.close()
+    return updated
+
+
 async def prune_expired() -> int:
     """Delete expired alerts. Returns count removed."""
     db = await get_db()

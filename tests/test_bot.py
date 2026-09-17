@@ -685,6 +685,159 @@ class TestUrgentAlerts(unittest.TestCase):
                     notifier.SEND_TELEGRAM_ALERTS = old_send
         _run(go())
 
+    def test_toggle_and_set_urgent(self):
+        async def go():
+            import database as db
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                aid = await db.add_alert("BTCUSDT", 70000, "above", is_urgent=False)
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_urgent"), 0)
+
+                # Toggle ON
+                new_val = await db.toggle_urgent(aid)
+                self.assertTrue(new_val)
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_urgent"), 1)
+
+                # Toggle OFF
+                new_val = await db.toggle_urgent(aid)
+                self.assertFalse(new_val)
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_urgent"), 0)
+
+                # Explicit set_urgent
+                res = await db.set_urgent(aid, True)
+                self.assertTrue(res)
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_urgent"), 1)
+
+                # Non-existent ID
+                self.assertIsNone(await db.toggle_urgent(999999))
+                self.assertFalse(await db.set_urgent(999999, True))
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_cmd_urgent_shortcut(self):
+        async def go():
+            from unittest.mock import AsyncMock, MagicMock, patch
+            import telegram_bot as tb
+            import database as db
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+
+                # Test 1: cmd_urgent with no args shows interactive keyboard
+                tb._last_cmd_at.clear()
+                update = MagicMock()
+                update.message = MagicMock()
+                update.message.reply_text = AsyncMock()
+                update.effective_user.id = 123
+                context = MagicMock()
+                context.args = []
+                context.bot_data = {"engine": None, "ws": AsyncMock()}
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    await tb.cmd_urgent(update, context)
+
+                update.message.reply_text.assert_called_once()
+                call_args, call_kwargs = update.message.reply_text.call_args
+                self.assertIn("Emergency Siren Alert", call_args[0])
+                self.assertIsNotNone(call_kwargs.get("reply_markup"))
+
+                # Test 2: cmd_urgent with args creates urgent alert
+                tb._last_cmd_at.clear()
+                update2 = MagicMock()
+                update2.message = MagicMock()
+                update2.message.reply_text = AsyncMock()
+                update2.effective_user.id = 123
+                context2 = MagicMock()
+                context2.args = ["BTC", "68000", "below"]
+                mock_ws = AsyncMock()
+                mock_ws.subscribe = AsyncMock()
+                mock_engine = MagicMock()
+                mock_engine.get_fresh_price = MagicMock(return_value=69000.0)
+                context2.bot_data = {"engine": mock_engine, "ws": mock_ws}
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123), \
+                     patch("telegram_bot._resolve_symbol", return_value=("BTCUSDT", 69000.0)):
+                    await tb.cmd_urgent(update2, context2)
+
+                alerts = await db.get_all_alerts()
+                self.assertEqual(len(alerts), 1)
+                self.assertEqual(db.alert_field(alerts[0], "symbol"), "BTCUSDT")
+                self.assertEqual(db.alert_field(alerts[0], "is_urgent"), 1)
+                self.assertIn("[🚨 URGENT]", update2.message.reply_text.call_args[0][0])
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_toggle_urgent_callback_and_wizard(self):
+        async def go():
+            from unittest.mock import AsyncMock, MagicMock, patch
+            import telegram_bot as tb
+            import database as db
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                aid = await db.add_alert("BTCUSDT", 70000, "above", is_urgent=False)
+
+                # Test 1: Callback toggle_urgent_{aid} toggles to ON
+                update = MagicMock()
+                update.callback_query = MagicMock()
+                update.callback_query.data = f"toggle_urgent_{aid}"
+                update.callback_query.answer = AsyncMock()
+                update.callback_query.edit_message_text = AsyncMock()
+                update.effective_user.id = 123
+                context = MagicMock()
+                context.bot_data = {"engine": None}
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    await tb.handle_callback(update, context)
+
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_urgent"), 1)
+                update.callback_query.answer.assert_called_with("🚨 Emergency Siren ENABLED")
+
+                # Test 2: Wizard siren type sets awaiting_custom_price and is_urgent flag
+                update2 = MagicMock()
+                update2.callback_query = MagicMock()
+                update2.callback_query.data = "addwiz_type_BTC_siren"
+                update2.callback_query.answer = AsyncMock()
+                update2.callback_query.edit_message_text = AsyncMock()
+                update2.effective_user.id = 123
+                context2 = MagicMock()
+                context2.user_data = {}
+                context2.bot_data = {"engine": None}
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    await tb.handle_callback(update2, context2)
+
+                self.assertEqual(context2.user_data.get("awaiting_custom_price"), "BTC")
+                self.assertTrue(context2.user_data.get("is_urgent"))
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
 
 class TestCharts(unittest.TestCase):
     def test_fear_and_greed_mock(self):

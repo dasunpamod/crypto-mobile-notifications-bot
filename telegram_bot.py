@@ -477,6 +477,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     is_urgent = any(t in rest for t in ("urgent", "siren"))
     expires_at = None
     for token in rest:
+        if token in ("repeat", "urgent", "siren") or token.startswith("cooldown="):
+            continue
         parsed = _parse_expiry(token)
         if parsed == "invalid":
             await update.message.reply_text("Bad expiry — use like `7d`, `12h`, `30m`.", parse_mode="Markdown")
@@ -574,6 +576,34 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if expires_at:
         tag += f" [expires {_fmt_ts(expires_at)}]"
     await update.message.reply_text(f"Alert(s) created{tag}:\n" + "\n".join(lines), parse_mode="Markdown")
+
+
+@authorized
+async def cmd_urgent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/urgent [args] or /siren [args] — create emergency siren alert with priority:5 and siren sound."""
+    if not context.args:
+        kb = [
+            [InlineKeyboardButton("🚨 BTC Siren", callback_data="addwiz_type_BTC_siren"),
+             InlineKeyboardButton("🚨 ETH Siren", callback_data="addwiz_type_ETH_siren")],
+            [InlineKeyboardButton("🚨 SOL Siren", callback_data="addwiz_type_SOL_siren"),
+             InlineKeyboardButton("🚨 HYPE Siren", callback_data="addwiz_type_HYPE_siren")],
+        ]
+        await update.message.reply_text(
+            "🚨 *Emergency Siren Alert*\n\n"
+            "Plays a loud siren on mobile (pierces DND & silent mode via Ntfy priority 5) and displays critical alert banner.\n\n"
+            "Select a coin below to configure, or type:\n"
+            "`/urgent BTC 68000 below`\n"
+            "`/urgent SOL 125 above repeat`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    args = list(context.args)
+    if not any(t in [a.lower() for a in args] for t in ("urgent", "siren")):
+        args.append("urgent")
+    context.args = args
+    await cmd_add(update, context)
 
 
 @authorized
@@ -765,7 +795,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "*Crypto Price Alert Bot*\n\n"
         "*Alerts:*\n"
-        "`/add BTC 72500 above` [repeat] [7d] [cooldown=15m]\n"
+        "`/urgent BTC 68000 below` — loud siren alert (priority 5)\n"
+        "`/add BTC 72500 above` [repeat] [urgent] [7d] [cooldown=15m]\n"
         "`/add ETH 5% up repeat`\n"
         "`/add BTC 76000,75000,79000` (multi)\n"
         "`/add BTC,ETH 80000,4000 above` (ladder)\n"
@@ -1421,6 +1452,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                        "Help", "Movers", "History")
         if any(label in text for label in menu_labels) or text.startswith("/"):
             context.user_data.pop("awaiting_custom_price", None)  # Cancel wizard
+            context.user_data.pop("is_urgent", None)
         else:
             # Support single or multiple comma- or space-separated prices
             raw_parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
@@ -1447,6 +1479,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             resolved = await _resolve_symbol(symbol, engine)
             if resolved is None:
                 context.user_data.pop("awaiting_custom_price", None)
+                context.user_data.pop("is_urgent", None)
                 await update.message.reply_text(f"Invalid coin `{_escape_md(awaiting_coin)}`. Wizard cancelled.", parse_mode="Markdown")
                 return
             symbol, price = resolved
@@ -1455,11 +1488,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
             if await db.count_alerts() + len(targets) > _max_alerts():
                 context.user_data.pop("awaiting_custom_price", None)
+                context.user_data.pop("is_urgent", None)
                 await update.message.reply_text(f"Alert limit reached ({_max_alerts()}). Remove one first with /list.")
                 return
 
             ws = context.bot_data["ws"]
             added = []
+            is_urgent = bool(context.user_data.pop("is_urgent", False))
             for target in targets:
                 if price is not None:
                     condition = "above" if target > price else "below"
@@ -1468,7 +1503,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 else:
                     condition = "above" if target > 1000 else "below"
 
-                alert_id = await db.add_alert(symbol, target, condition, False)
+                alert_id = await db.add_alert(symbol, target, condition, False, is_urgent=is_urgent)
                 added.append((alert_id, target, condition))
 
             await ws.subscribe(symbol)
@@ -1479,24 +1514,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await update.message.reply_text("Target equals the current price — no alert added.")
                 return
 
+            urgent_badge = " [🚨 URGENT]" if is_urgent else ""
             if len(added) == 1:
                 aid, target, condition = added[0]
+                prefix = "🚨 *Emergency Siren Alert" if is_urgent else "✅ Alert"
                 if price is not None:
                     await update.message.reply_text(
-                        f"✅ Alert #{aid} added: *{coin}* {condition} *{format_price(target)}* "
-                        f"(now {format_price(price)}).",
+                        f"{prefix} #{aid} added: *{coin}* {condition} *{format_price(target)}* "
+                        f"(now {format_price(price)}){urgent_badge}.",
                         parse_mode="Markdown",
                     )
                 else:
                     await update.message.reply_text(
-                        f"✅ Alert #{aid} added: *{coin}* {condition} *{format_price(target)}*.",
+                        f"{prefix} #{aid} added: *{coin}* {condition} *{format_price(target)}*{urgent_badge}.",
                         parse_mode="Markdown",
                     )
             else:
                 now_str = f" (now {format_price(price)})" if price is not None else ""
-                lines = [f"✅ Added *{len(added)}* alerts for *{coin}*{now_str}:"]
+                header = (
+                    f"🚨 *Added {len(added)} Emergency Siren alerts for {coin}*{now_str}:"
+                    if is_urgent
+                    else f"✅ Added *{len(added)}* alerts for *{coin}*{now_str}:"
+                )
+                lines = [header]
                 for aid, target, condition in added:
-                    lines.append(f"  • #{aid} {condition} *{format_price(target)}*")
+                    lines.append(f"  • #{aid} {condition} *{format_price(target)}*{urgent_badge}")
                 await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
             return
 
@@ -1695,18 +1737,62 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 pass
             return
         coin = _escape_md(db.alert_field(alert, "symbol", "").replace("USDT", ""))
+        is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
+        siren_btn = (
+            InlineKeyboardButton("🔕 Turn OFF Siren", callback_data=f"toggle_urgent_{alert_id}")
+            if is_urgent
+            else InlineKeyboardButton("🚨 Turn ON Siren", callback_data=f"toggle_urgent_{alert_id}")
+        )
         kb = [
             [InlineKeyboardButton("Snooze 12h", callback_data=f"snooze_{alert_id}_12h"),
              InlineKeyboardButton("Snooze 24h", callback_data=f"snooze_{alert_id}_24h")],
+            [siren_btn],
             [InlineKeyboardButton("Remove", callback_data=f"remove_{alert_id}")]
         ]
+        urgent_badge = " [🚨 URGENT]" if is_urgent else ""
         try:
             await query.edit_message_text(
-                f"*{coin}* #{alert_id} — what do you want to do?",
+                f"*{coin}* #{alert_id}{urgent_badge} — what do you want to do?",
                 parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb),
             )
         except Exception:
             pass
+        return
+
+    if data.startswith("toggle_urgent_"):
+        try:
+            alert_id = int(data.split("_")[2])
+        except (ValueError, IndexError):
+            return
+        new_state = await db.toggle_urgent(alert_id)
+        if new_state is None:
+            await query.answer("Alert not found.", show_alert=True)
+            return
+        status_str = "🚨 Emergency Siren ENABLED" if new_state else "🔕 Siren DISABLED"
+        await query.answer(status_str)
+        alert = await db.get_alert(alert_id)
+        if alert:
+            coin = _escape_md(db.alert_field(alert, "symbol", "").replace("USDT", ""))
+            is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
+            siren_btn = (
+                InlineKeyboardButton("🔕 Turn OFF Siren", callback_data=f"toggle_urgent_{alert_id}")
+                if is_urgent
+                else InlineKeyboardButton("🚨 Turn ON Siren", callback_data=f"toggle_urgent_{alert_id}")
+            )
+            kb = [
+                [InlineKeyboardButton("Snooze 12h", callback_data=f"snooze_{alert_id}_12h"),
+                 InlineKeyboardButton("Snooze 24h", callback_data=f"snooze_{alert_id}_24h")],
+                [siren_btn],
+                [InlineKeyboardButton("Remove", callback_data=f"remove_{alert_id}")]
+            ]
+            urgent_badge = " [🚨 URGENT]" if is_urgent else ""
+            try:
+                await query.edit_message_text(
+                    f"*{coin}* #{alert_id}{urgent_badge} — what do you want to do?",
+                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb),
+                )
+            except Exception:
+                pass
         return
 
     if data.startswith("snooze_"):
@@ -1809,7 +1895,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         kb = [
             [InlineKeyboardButton("5% Pump (Repeat)", callback_data=f"addwiz_type_{coin}_5pump")],
             [InlineKeyboardButton("5% Drop (Repeat)", callback_data=f"addwiz_type_{coin}_5drop")],
-            [InlineKeyboardButton("Custom Price(s)", callback_data=f"addwiz_type_{coin}_custom")]
+            [InlineKeyboardButton("Custom Price(s)", callback_data=f"addwiz_type_{coin}_custom")],
+            [InlineKeyboardButton("🚨 Emergency Siren Alert", callback_data=f"addwiz_type_{coin}_siren")]
         ]
         try:
             await query.edit_message_text(
@@ -1864,8 +1951,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
             except Exception:
                 pass
+        elif atype == "siren":
+            context.user_data["awaiting_custom_price"] = coin
+            context.user_data["is_urgent"] = True
+            coin_safe = _escape_md(coin)
+            try:
+                await query.edit_message_text(
+                    f"🚨 *Set Emergency Siren Alert for {coin_safe}:*\n\n"
+                    f"Send target price(s) (e.g. `68000` or `125`):\n"
+                    f"• Loud phone siren piercing Do Not Disturb / silent mode\n"
+                    f"• Marked with [🚨 URGENT] badge and critical alert banner\n\n"
+                    f"_Prices are automatically set to above/below based on market price._",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
         elif atype == "custom":
             context.user_data["awaiting_custom_price"] = coin
+            context.user_data.pop("is_urgent", None)
             coin_safe = _escape_md(coin)
             try:
                 await query.edit_message_text(
@@ -1889,6 +1992,8 @@ async def _post_init(application: Application) -> None:
         BotCommand("start", "Show interactive menu & buttons"),
         BotCommand("help", "Show help & full command list"),
         BotCommand("add", "Add a price alert (e.g. /add BTC 70000)"),
+        BotCommand("urgent", "Create emergency siren alert (loud sound + max priority)"),
+        BotCommand("siren", "Alias for /urgent"),
         BotCommand("list", "View and manage active alerts"),
         BotCommand("price", "Check current crypto prices"),
         BotCommand("movers", "Top 24h market gainers & losers"),
@@ -1929,6 +2034,8 @@ def create_bot(alert_engine, binance_ws) -> Application:
     app.add_handler(CommandHandler("start", cmd_help))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("urgent", cmd_urgent))
+    app.add_handler(CommandHandler("siren", cmd_urgent))
     app.add_handler(CommandHandler("grid", cmd_grid))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("remove", cmd_remove))
