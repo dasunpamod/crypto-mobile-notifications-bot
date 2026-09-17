@@ -89,6 +89,53 @@ def _parse_expiry(text: str):
     return "invalid"
 
 
+COIN_ICONS: dict[str, str] = {
+    "BTC": "🟠",      # Bitcoin Orange
+    "ETH": "🔷",      # Ethereum Blue Diamond
+    "SOL": "🟣",      # Solana Purple
+    "HYPE": "⚡",     # Hyperliquid Flash
+    "DOGE": "🐶",     # Dogecoin Dog
+    "XRP": "💧",      # Ripple Droplet
+    "BNB": "🟡",      # Binance Gold
+    "ADA": "🔹",      # Cardano Blue
+    "AVAX": "🔺",     # Avalanche Red Triangle
+    "LINK": "🔗",     # Chainlink Chain
+    "SUI": "💧",      # Sui Droplet
+    "PEPE": "🐸",     # Pepe Frog
+    "SHIB": "🐕",     # Shiba Inu
+    "TON": "💎",      # TON Crystal
+    "NEAR": "🌐",     # NEAR Protocol
+    "LTC": "🥈",      # Litecoin Silver
+    "DOT": "⚪",      # Polkadot Dot
+    "MATIC": "🟣",    # Polygon Purple
+    "POL": "🟣",      # Polygon
+    "TRX": "🔴",      # Tron Red
+    "ARB": "🔵",      # Arbitrum Blue
+    "OP": "🔴",       # Optimism Red
+    "UNI": "🦄",      # Uniswap Unicorn
+    "AAVE": "👻",     # Aave Ghost
+    "ATOM": "⚛️",     # Cosmos Atom
+    "XMR": "🔒",      # Monero Privacy
+    "RENDER": "🎨",   # Render Network
+    "FET": "🤖",      # AI Superintelligence
+    "TAO": "🧠",      # Bittensor Brain
+    "INJ": "🥷",      # Injective
+    "KAS": "💠",      # Kaspa
+    "APT": "🧬",      # Aptos
+    "FTM": "👻",      # Fantom
+    "ICP": "♾️",      # Internet Computer Infinity
+    "WIF": "🧢",      # Dogwifhat Cap
+    "BONK": "🐕",     # Bonk Dog
+    "FLOKI": "⚔️",     # Floki Viking
+}
+
+
+def coin_icon(symbol: str) -> str:
+    """Return dedicated, colorful visual icon for cryptocurrency symbols."""
+    coin = (symbol or "").upper().replace("USDT", "").replace("USD", "").strip()
+    return COIN_ICONS.get(coin, "💎")
+
+
 def _watchlist_defaults() -> list:
     out = list(config.WATCHLIST_SYMBOLS or ())
     for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"):
@@ -135,7 +182,7 @@ async def _send_all_prices(target, engine, context=None, prefix="*Prices*\n") ->
             continue
         pct = ticker_change_24h(ticker or cached_ticker(symbol))
         extra = f" ({_fmt_pct(pct)} 24h)" if pct is not None else ""
-        lines.append(f"  *{coin}*: {format_price(price)}{extra}")
+        lines.append(f"  {coin_icon(symbol)} *{coin}*: {format_price(price)}{extra}")
     stamp = config.now_local().strftime("%H:%M")
     lines.append(f"\n_Updated {stamp}_")
     kb = [[InlineKeyboardButton("Refresh all", callback_data="prices_all")]]
@@ -330,7 +377,7 @@ async def _render_dashboard(engine) -> tuple[str, InlineKeyboardMarkup]:
         ticker = cached_ticker(sym)
         pct = ticker_change_24h(ticker)
         pct_str = f" ({_fmt_pct(pct)})" if pct is not None else ""
-        lines.append(f"  • *{coin}*: {format_price(price) if price else 'loading...'}{pct_str}")
+        lines.append(f"  • {coin_icon(sym)} *{coin}*: {format_price(price) if price else 'loading...'}{pct_str}")
 
     lines.append("")
     lines.append("👇 *Tap an action below to manage or navigate:*")
@@ -388,7 +435,7 @@ async def _show_coin_card(target, symbol: str, engine=None) -> None:
     tv_embed_url = charts.get_tradingview_embed_url(symbol, interval="1h")
 
     lines = [
-        f"🪙 *{coin_safe} / USDT*",
+        f"{coin_icon(coin)} *{coin_safe} / USDT*",
         f"💰 Price: *{format_price(price) if price else 'N/A'}*{pct_str}",
         f"🔔 Active Alerts: *{alert_count}*",
     ]
@@ -467,8 +514,8 @@ async def _render_watch_deck(engine=None) -> tuple[str, InlineKeyboardMarkup]:
         ticker = cached_ticker(sym)
         pct = ticker_change_24h(ticker)
         pct_str = f" ({_fmt_pct(pct)})" if pct is not None else ""
-        lines.append(f"  • *{_escape_md(coin)}*: {format_price(p) if p else 'N/A'}{pct_str}")
-        current_row.append(InlineKeyboardButton(f"🪙 {coin}", callback_data=f"coin_card_{coin}"))
+        lines.append(f"  • {coin_icon(sym)} *{_escape_md(coin)}*: {format_price(p) if p else 'N/A'}{pct_str}")
+        current_row.append(InlineKeyboardButton(f"{coin_icon(coin)} {coin}", callback_data=f"coin_card_{coin}"))
         if len(current_row) == 3:
             kb.append(current_row)
             current_row = []
@@ -552,12 +599,16 @@ async def _render_charts_hub() -> tuple[str, InlineKeyboardMarkup]:
     ]
     kb = [
         [
-            InlineKeyboardButton("📸 BTC Chart", callback_data="chart_BTCUSDT_1h_tv"),
-            InlineKeyboardButton("📸 ETH Chart", callback_data="chart_ETHUSDT_1h_tv"),
+            InlineKeyboardButton(f"{coin_icon('BTC')} BTC Chart", callback_data="chart_BTCUSDT_1h_tv"),
+            InlineKeyboardButton(f"{coin_icon('ETH')} ETH Chart", callback_data="chart_ETHUSDT_1h_tv"),
         ],
         [
-            InlineKeyboardButton("📸 SOL Chart", callback_data="chart_SOLUSDT_1h_tv"),
-            InlineKeyboardButton("📸 HYPE Chart", callback_data="chart_HYPEUSDT_1h_tv"),
+            InlineKeyboardButton(f"{coin_icon('SOL')} SOL Chart", callback_data="chart_SOLUSDT_1h_tv"),
+            InlineKeyboardButton(f"{coin_icon('HYPE')} HYPE Chart", callback_data="chart_HYPEUSDT_1h_tv"),
+        ],
+        [
+            InlineKeyboardButton(f"{coin_icon('DOGE')} DOGE Chart", callback_data="chart_DOGEUSDT_1h_tv"),
+            InlineKeyboardButton(f"{coin_icon('XRP')} XRP Chart", callback_data="chart_XRPUSDT_1h_tv"),
         ],
         [
             InlineKeyboardButton("🚀 Open Live TV Chart (BTC)", web_app=WebAppInfo(url=charts.get_tradingview_embed_url("BTCUSDT"))),
@@ -576,9 +627,9 @@ async def _render_wiz_start() -> tuple[str, InlineKeyboardMarkup]:
         "Choose one of the popular coins below, or type any coin ticker (e.g. `DOGE`):",
     ]
     kb = [
-        [InlineKeyboardButton("🪙 BTC", callback_data="wiz_coin_BTC"), InlineKeyboardButton("🪙 ETH", callback_data="wiz_coin_ETH")],
-        [InlineKeyboardButton("🪙 SOL", callback_data="wiz_coin_SOL"), InlineKeyboardButton("🪙 HYPE", callback_data="wiz_coin_HYPE")],
-        [InlineKeyboardButton("🪙 DOGE", callback_data="wiz_coin_DOGE"), InlineKeyboardButton("🪙 XRP", callback_data="wiz_coin_XRP")],
+        [InlineKeyboardButton(f"{coin_icon('BTC')} BTC", callback_data="wiz_coin_BTC"), InlineKeyboardButton(f"{coin_icon('ETH')} ETH", callback_data="wiz_coin_ETH")],
+        [InlineKeyboardButton(f"{coin_icon('SOL')} SOL", callback_data="wiz_coin_SOL"), InlineKeyboardButton(f"{coin_icon('HYPE')} HYPE", callback_data="wiz_coin_HYPE")],
+        [InlineKeyboardButton(f"{coin_icon('DOGE')} DOGE", callback_data="wiz_coin_DOGE"), InlineKeyboardButton(f"{coin_icon('XRP')} XRP", callback_data="wiz_coin_XRP")],
         [InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main")],
     ]
     return "\n".join(lines), InlineKeyboardMarkup(kb)
@@ -596,7 +647,7 @@ async def _render_wiz_coin(coin: str, engine=None) -> tuple[str, InlineKeyboardM
             price = None
 
     lines = [
-        f"🎯 *Set Alert for {coin_safe}*",
+        f"🎯 *Set Alert for {coin_icon(coin)} {coin_safe}*",
         f"Current Price: *{format_price(price) if price else 'N/A'}*",
         "",
         "Choose an alert type or 1-tap percentage:",
@@ -629,7 +680,7 @@ async def _render_wiz_coin(coin: str, engine=None) -> tuple[str, InlineKeyboardM
 async def _render_wiz_trail(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
     """Generate Trailing Stop wizard presets."""
     lines = [
-        f"🪢 *Trailing Stop Alert for {coin.upper()}*",
+        f"🪢 *{coin_icon(coin)} {coin.upper()} Trailing Stop Alert*",
         "Alerts when price pulls back by X% from its highest peak:",
     ]
     kb = [
@@ -643,7 +694,7 @@ async def _render_wiz_trail(coin: str, engine=None) -> tuple[str, InlineKeyboard
 async def _render_wiz_move(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
     """Generate Volatility Move wizard presets."""
     lines = [
-        f"⚡ *Volatility Move Alert for {coin.upper()}*",
+        f"⚡ *{coin_icon(coin)} {coin.upper()} Volatility Move Alert*",
         "Alerts on rapid price surges or drops within a time window:",
     ]
     kb = [
@@ -665,7 +716,7 @@ async def _render_wiz_grid(coin: str, engine=None) -> tuple[str, InlineKeyboardM
             price = None
 
     lines = [
-        f"📐 *Price Grid Setup for {coin.upper()}*",
+        f"📐 *{coin_icon(coin)} {coin.upper()} Price Grid Setup*",
         f"Current Price: *{format_price(price) if price else 'N/A'}*",
         "",
         "Instantly deploy laddered alerts above and below market:",
@@ -713,7 +764,7 @@ async def _render_alert_editor(alert_id: int) -> tuple[str, InlineKeyboardMarkup
 
     lines = [
         f"⚙️ *Manage Alert #{alert_id}*",
-        f"• Coin: *{coin}*",
+        f"• Coin: {coin_icon(symbol)} *{coin}*",
         f"• Target: *{condition.upper()}* `{target_str}`" if atype == "price" else f"• Type: *{target_str}*",
         f"• Mode: {'🔁 Repeat' if is_persistent else '🎯 Once'}",
         f"• Siren: {'🚨 ENABLED (Loud)' if is_urgent else '🔕 Standard'}",
@@ -821,7 +872,7 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
         if expires:
             flags.append(f"expires {_fmt_ts(expires)}")
         flag_txt = f" ({', '.join(flags)})" if flags else " (once)"
-        lines.append(f"  #{alert_id}{flag_txt} *{coin}* {desc}")
+        lines.append(f"  #{alert_id}{flag_txt} {coin_icon(symbol)} *{coin}* {desc}")
         keyboard.append([
             InlineKeyboardButton(f"⚙️ Edit #{alert_id}", callback_data=f"edit_{alert_id}"),
             InlineKeyboardButton(f"❌ Remove #{alert_id}", callback_data=f"remove_{alert_id}"),
@@ -835,7 +886,7 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
             coin = _escape_md(symbol.replace("USDT", ""))
             pct = ticker_change_24h(cached_ticker(symbol))
             extra = f" ({_fmt_pct(pct)})" if pct is not None else ""
-            lines.append(f"  {coin}: {format_price(price)}{extra}")
+            lines.append(f"  {coin_icon(symbol)} {coin}: {format_price(price)}{extra}")
 
     nav = []
     tag = f"|{filt}" if filt else ""
@@ -1258,7 +1309,7 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             pct = ticker_change_24h(ticker or cached_ticker(symbol))
             if pct is not None:
                 extra = f" ({_fmt_pct(pct)} 24h)"
-            await update.message.reply_text(f"*{coin}*: {format_price(price)}{extra}", parse_mode="Markdown")
+            await update.message.reply_text(f"{coin_icon(symbol)} *{coin}*: {format_price(price)}{extra}", parse_mode="Markdown")
         else:
             await update.message.reply_text(f"Could not fetch price for {coin} (unknown symbol or API issue).")
         return
@@ -1273,11 +1324,11 @@ async def cmd_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if price is None:
             price = cached_price(symbol, max_age_sec=120)
         if price is None:
-            lines.append(f"  *{coin}*: unavailable")
+            lines.append(f"  {coin_icon(symbol)} *{coin}*: unavailable")
             continue
         pct = ticker_change_24h(tickers.get(symbol) or cached_ticker(symbol))
         extra = f" ({_fmt_pct(pct)} 24h)" if pct is not None else ""
-        lines.append(f"  *{coin}*: {format_price(price)}{extra}")
+        lines.append(f"  {coin_icon(symbol)} *{coin}*: {format_price(price)}{extra}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
@@ -2493,9 +2544,9 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         await answer()
         context.user_data["awaiting_watch_coin"] = True
         kb = [
-            [InlineKeyboardButton("+DOGE", callback_data="watch_add_quick_DOGE"), InlineKeyboardButton("+XRP", callback_data="watch_add_quick_XRP")],
-            [InlineKeyboardButton("+PEPE", callback_data="watch_add_quick_PEPE"), InlineKeyboardButton("+ADA", callback_data="watch_add_quick_ADA")],
-            [InlineKeyboardButton("+AVAX", callback_data="watch_add_quick_AVAX"), InlineKeyboardButton("+LINK", callback_data="watch_add_quick_LINK")],
+            [InlineKeyboardButton(f"{coin_icon('DOGE')} +DOGE", callback_data="watch_add_quick_DOGE"), InlineKeyboardButton(f"{coin_icon('XRP')} +XRP", callback_data="watch_add_quick_XRP")],
+            [InlineKeyboardButton(f"{coin_icon('PEPE')} +PEPE", callback_data="watch_add_quick_PEPE"), InlineKeyboardButton(f"{coin_icon('ADA')} +ADA", callback_data="watch_add_quick_ADA")],
+            [InlineKeyboardButton(f"{coin_icon('AVAX')} +AVAX", callback_data="watch_add_quick_AVAX"), InlineKeyboardButton(f"{coin_icon('LINK')} +LINK", callback_data="watch_add_quick_LINK")],
             [InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")],
         ]
         await _safe_edit_md(
@@ -2520,7 +2571,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
     if data == "watch_del_wiz":
         await answer()
         watch = await _effective_watchlist()
-        kb = [[InlineKeyboardButton(f"❌ Remove {s.replace('USDT', '')}", callback_data=f"watch_remove_{s.replace('USDT', '')}")] for s in watch]
+        kb = [[InlineKeyboardButton(f"❌ Remove {coin_icon(s)} {s.replace('USDT', '')}", callback_data=f"watch_remove_{s.replace('USDT', '')}")] for s in watch]
         kb.append([InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")])
         await _safe_edit_md(
             query,

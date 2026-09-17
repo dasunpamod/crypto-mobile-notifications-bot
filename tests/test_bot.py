@@ -1255,7 +1255,8 @@ class TestUIRedesign(unittest.TestCase):
                 self.assertIn("Step 1: Select a Coin", wiz_text)
 
                 coin_text, coin_markup = await _render_wiz_coin("BTC", mock_engine)
-                self.assertIn("Set Alert for BTC", coin_text)
+                self.assertIn("Set Alert for", coin_text)
+                self.assertIn("BTC", coin_text)
             finally:
                 await db.close_db()
                 db.DB_PATH, db._db = old_path, old_conn
