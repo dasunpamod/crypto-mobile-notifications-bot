@@ -253,6 +253,20 @@ async def toggle_urgent(alert_id: int) -> bool | None:
     return bool(new_val)
 
 
+async def toggle_persistent(alert_id: int) -> bool | None:
+    """Toggle is_persistent flag for an alert. Returns the new boolean value, or None if alert not found."""
+    db = await get_db()
+    cursor = await db.execute("SELECT is_persistent FROM alerts WHERE id = ?", (alert_id,))
+    row = await cursor.fetchone()
+    await cursor.close()
+    if not row:
+        return None
+    new_val = 0 if row[0] else 1
+    await db.execute("UPDATE alerts SET is_persistent = ? WHERE id = ?", (new_val, alert_id))
+    await db.commit()
+    return bool(new_val)
+
+
 async def set_urgent(alert_id: int, is_urgent: bool) -> bool:
     """Set is_urgent flag for an alert. Returns True if alert was found and updated."""
     db = await get_db()
@@ -381,6 +395,26 @@ async def remove_watch(symbol: str) -> bool:
     removed = cursor.rowcount > 0
     await cursor.close()
     return removed
+
+
+async def is_watched(symbol: str) -> bool:
+    """Check if a symbol is in the watchlist."""
+    db = await get_db()
+    cursor = await db.execute("SELECT 1 FROM watchlist WHERE symbol = ?", (normalize_symbol(symbol),))
+    row = await cursor.fetchone()
+    await cursor.close()
+    return bool(row)
+
+
+async def toggle_watch(symbol: str) -> bool:
+    """Toggle watchlist for a symbol. Returns True if now watched, False if unwatched."""
+    watched = await is_watched(symbol)
+    if watched:
+        await remove_watch(symbol)
+        return False
+    else:
+        await add_watch(symbol)
+        return True
 
 
 async def kv_get(key: str, default: str = "") -> str:

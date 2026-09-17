@@ -213,15 +213,465 @@ __all__ = ["format_price", "get_current_price", "create_bot"]
 # (single source of truth lives in prices.py).
 
 
-def get_main_keyboard(engine):
-    """Create the persistent main menu keyboard."""
-    pause_btn = "▶️ Resume" if engine.is_muted() else "⏸️ Pause"
+def get_main_keyboard(engine=None):
+    """Create the clean 4-button persistent main menu keyboard."""
     keyboard = [
-        [KeyboardButton("📋 My Alerts"), KeyboardButton("💰 Prices")],
-        [KeyboardButton("➕ Add Alert"), KeyboardButton("📊 Movers")],
-        [KeyboardButton(pause_btn), KeyboardButton("📜 History")],
+        [KeyboardButton("⚡ Dashboard"), KeyboardButton("➕ Set Alert")],
+        [KeyboardButton("💰 Prices"), KeyboardButton("📋 My Alerts")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+async def _render_dashboard(engine) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate text and inline navigation buttons for the Master Command Center."""
+    watch = await _effective_watchlist()
+    alert_count = await db.count_alerts()
+    symbols = list(watch[:4])
+    tickers = await get_tickers(symbols)
+
+    status_str = "⏸️ *ALERTS PAUSED*" if (engine and engine.is_muted()) else "🟢 *ONLINE (Active)*"
+    stamp = config.now_local().strftime("%H:%M:%S")
+
+    lines = [
+        "⚡ *CRYPTO COMMAND CENTER*",
+        f"Status: {status_str}  •  `{stamp}`",
+        f"Active Alerts: *{alert_count}*  •  Watchlist: *{len(watch)}*",
+        "",
+        "📊 *Market Snapshot*",
+    ]
+
+    for sym in symbols:
+        coin = _escape_md(sym.replace("USDT", ""))
+        ticker = tickers.get(sym)
+        price = ticker_price(ticker)
+        if price is None and engine:
+            price = engine.get_fresh_price(sym, max_age_sec=30)
+        if price is None:
+            price = cached_price(sym, max_age_sec=120)
+        pct = ticker_change_24h(ticker or cached_ticker(sym))
+        pct_str = f" ({_fmt_pct(pct)})" if pct is not None else ""
+        lines.append(f"  • *{coin}*: {format_price(price) if price else 'loading...'}{pct_str}")
+
+    lines.append("")
+    lines.append("👇 *Tap an action below to manage or navigate:*")
+
+    pause_label = "▶️ Resume Alerts" if (engine and engine.is_muted()) else "⏸️ Pause Alerts"
+    pause_cb = "pause_resume" if (engine and engine.is_muted()) else "hub_pause"
+
+    kb = [
+        [
+            InlineKeyboardButton("➕ Set Alert", callback_data="wiz_start"),
+            InlineKeyboardButton("📋 My Alerts", callback_data="hub_alerts"),
+        ],
+        [
+            InlineKeyboardButton("📊 Top Movers", callback_data="hub_movers"),
+            InlineKeyboardButton("📈 Charts & TA", callback_data="hub_charts"),
+        ],
+        [
+            InlineKeyboardButton("👁️ Watchlist", callback_data="hub_watch"),
+            InlineKeyboardButton("📐 Grid Wizard", callback_data="hub_grid"),
+        ],
+        [
+            InlineKeyboardButton(pause_label, callback_data=pause_cb),
+            InlineKeyboardButton("🛠️ Tools & Status", callback_data="hub_tools"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="hub_refresh"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _show_coin_card(target, symbol: str, engine=None) -> None:
+    """Render a dedicated zero-dead-end Coin Action Card."""
+    symbol = normalize_symbol(symbol)
+    coin = symbol.replace("USDT", "")
+    coin_safe = _escape_md(coin)
+    ticker = await get_ticker(symbol)
+    price = ticker_price(ticker)
+    if price is None and engine:
+        price = engine.get_fresh_price(symbol, max_age_sec=30)
+    if price is None:
+        price = cached_price(symbol, max_age_sec=120)
+
+    pct = ticker_change_24h(ticker or cached_ticker(symbol))
+    pct_str = f" ({_fmt_pct(pct)} 24h)" if pct is not None else ""
+
+    watched = await db.is_watched(symbol)
+    watch_btn_label = "👁️ Unwatch" if watched else "👁️ +Watch"
+
+    alerts = await db.get_alerts_for_symbol(symbol)
+    alert_count = len(alerts)
+
+    tv_embed_url = charts.get_tradingview_embed_url(symbol, interval="1h")
+
+    lines = [
+        f"🪙 *{coin_safe} / USDT*",
+        f"💰 Price: *{format_price(price) if price else 'N/A'}*{pct_str}",
+        f"🔔 Active Alerts: *{alert_count}*",
+    ]
+    if ticker:
+        high = ticker.get("highPrice") or ticker.get("h")
+        low = ticker.get("lowPrice") or ticker.get("l")
+        if high and low:
+            try:
+                lines.append(f"📈 24h Range: ${float(low):,.2f} — ${float(high):,.2f}")
+            except Exception:
+                pass
+
+    lines.append("\n_Select an action below:_")
+
+    kb = [
+        [
+            InlineKeyboardButton("📈 View Chart", callback_data=f"chart_{symbol}_1h_tv"),
+            InlineKeyboardButton("➕ Quick Alert", callback_data=f"wiz_coin_{coin}"),
+        ],
+        [
+            InlineKeyboardButton("🚨 Siren Alert", callback_data=f"wiz_type_{coin}_siren"),
+            InlineKeyboardButton("📐 Grid Range", callback_data=f"wiz_grid_{coin}"),
+        ],
+        [
+            InlineKeyboardButton(watch_btn_label, callback_data=f"watch_toggle_{coin}"),
+            InlineKeyboardButton("🚀 Live TV Chart", web_app=WebAppInfo(url=tv_embed_url)),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Dashboard", callback_data="hub_main"),
+        ],
+    ]
+    markup = InlineKeyboardMarkup(kb)
+    if hasattr(target, "reply_text"):
+        await target.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+    else:
+        await target.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+
+
+async def _render_movers_deck() -> tuple[str, InlineKeyboardMarkup]:
+    """Generate the interactive Top Movers deck with direct coin cards."""
+    rows = await get_top_movers(8)
+    if not rows:
+        return "Could not fetch top movers right now.", InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main")]])
+
+    lines = ["📊 *Top 24h Market Movers*\n_Tap any coin to open its action card & charts:_\n"]
+    kb = []
+    current_row = []
+    for symbol, price, pct in rows:
+        coin = symbol.replace("USDT", "")
+        sign = "🟢 +" if pct >= 0 else "🔴 "
+        pct_display = f"{float(pct)*100:+.1f}%"
+        btn_label = f"{sign}{coin} {pct_display}"
+        current_row.append(InlineKeyboardButton(btn_label, callback_data=f"coin_card_{coin}"))
+        if len(current_row) == 2:
+            kb.append(current_row)
+            current_row = []
+    if current_row:
+        kb.append(current_row)
+
+    kb.append([
+        InlineKeyboardButton("🔄 Refresh Movers", callback_data="hub_movers"),
+        InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_watch_deck(engine=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate the interactive Watchlist deck."""
+    watch = await _effective_watchlist()
+    tickers = await get_tickers(watch)
+    lines = ["👁️ *Watchlist Deck*\n_Tap any coin to view charts, set alerts, or manage:_\n"]
+    kb = []
+    current_row = []
+    for sym in watch:
+        coin = sym.replace("USDT", "")
+        ticker = tickers.get(sym)
+        p = ticker_price(ticker)
+        if p is None and engine:
+            p = engine.get_fresh_price(sym, max_age_sec=30)
+        if p is None:
+            p = cached_price(sym, max_age_sec=120)
+        pct = ticker_change_24h(ticker or cached_ticker(sym))
+        pct_str = f" ({_fmt_pct(pct)})" if pct is not None else ""
+        lines.append(f"  • *{_escape_md(coin)}*: {format_price(p) if p else 'N/A'}{pct_str}")
+        current_row.append(InlineKeyboardButton(f"🪙 {coin}", callback_data=f"coin_card_{coin}"))
+        if len(current_row) == 3:
+            kb.append(current_row)
+            current_row = []
+    if current_row:
+        kb.append(current_row)
+
+    kb.append([
+        InlineKeyboardButton("➕ Add Coin", callback_data="watch_add_wiz"),
+        InlineKeyboardButton("🗑️ Remove Coin", callback_data="watch_del_wiz"),
+    ])
+    kb.append([
+        InlineKeyboardButton("🔄 Refresh Watchlist", callback_data="hub_watch"),
+        InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_pause_deck(engine=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate the interactive Pause control deck."""
+    is_paused = engine.is_muted() if engine else False
+    status_text = "⏸️ *Alerts are currently PAUSED.*" if is_paused else "🟢 *Alerts are currently ACTIVE.*"
+    lines = [
+        "⏸️ *Pause / Resume Alert Control*",
+        status_text,
+        "",
+        "Choose a duration to silence all notifications without deleting alerts:",
+    ]
+    kb = [
+        [
+            InlineKeyboardButton("⏸️ 15m", callback_data="pause_dur_15m"),
+            InlineKeyboardButton("⏸️ 1h", callback_data="pause_dur_1h"),
+            InlineKeyboardButton("⏸️ 4h", callback_data="pause_dur_4h"),
+            InlineKeyboardButton("⏸️ 24h", callback_data="pause_dur_24h"),
+        ],
+        [
+            InlineKeyboardButton("▶️ Resume Alerts Now", callback_data="pause_resume"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_tools_deck(engine=None, ws=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate the Tools and System Health deck."""
+    stats = engine.get_stats() if engine and hasattr(engine, "get_stats") else {}
+    ws_connected = getattr(ws, "connected", False) if ws else False
+    lines = [
+        "🛠️ *Tools & Diagnostics Hub*",
+        f"• WebSocket: {'🟢 Connected' if ws_connected else '🔴 Disconnected'}",
+        f"• Price Checks: {stats.get('checks', 0)}  |  Triggered: {stats.get('triggered', 0)}",
+        f"• Queued Notifications: {await db.pending_count()}",
+        "",
+        "Quick Actions:",
+    ]
+    kb = [
+        [
+            InlineKeyboardButton("📜 Fired History", callback_data="hub_history"),
+            InlineKeyboardButton("🩺 Watchdog Health", callback_data="hub_health"),
+        ],
+        [
+            InlineKeyboardButton("💾 Backup Database", callback_data="hub_backup"),
+            InlineKeyboardButton("📤 Export JSON", callback_data="hub_export"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Update from GitHub", callback_data="hub_update"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_charts_hub() -> tuple[str, InlineKeyboardMarkup]:
+    """Generate the Charts and TA hub."""
+    lines = [
+        "📈 *Charts & Technical Analysis Hub*",
+        "Select a coin to generate a chart, or open the Live TradingView WebApp:",
+    ]
+    kb = [
+        [
+            InlineKeyboardButton("📸 BTC Chart", callback_data="chart_BTCUSDT_1h_tv"),
+            InlineKeyboardButton("📸 ETH Chart", callback_data="chart_ETHUSDT_1h_tv"),
+        ],
+        [
+            InlineKeyboardButton("📸 SOL Chart", callback_data="chart_SOLUSDT_1h_tv"),
+            InlineKeyboardButton("📸 HYPE Chart", callback_data="chart_HYPEUSDT_1h_tv"),
+        ],
+        [
+            InlineKeyboardButton("🚀 Open Live TV Chart (BTC)", web_app=WebAppInfo(url=charts.get_tradingview_embed_url("BTCUSDT"))),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_wiz_start() -> tuple[str, InlineKeyboardMarkup]:
+    """Generate Alert Wizard: Step 1 Coin Selection."""
+    lines = [
+        "➕ *Step 1: Select a Coin for your Alert*",
+        "Choose one of the popular coins below, or type any coin ticker (e.g. `DOGE`):",
+    ]
+    kb = [
+        [InlineKeyboardButton("🪙 BTC", callback_data="wiz_coin_BTC"), InlineKeyboardButton("🪙 ETH", callback_data="wiz_coin_ETH")],
+        [InlineKeyboardButton("🪙 SOL", callback_data="wiz_coin_SOL"), InlineKeyboardButton("🪙 HYPE", callback_data="wiz_coin_HYPE")],
+        [InlineKeyboardButton("🪙 DOGE", callback_data="wiz_coin_DOGE"), InlineKeyboardButton("🪙 XRP", callback_data="wiz_coin_XRP")],
+        [InlineKeyboardButton("🔙 Back to Hub", callback_data="hub_main")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_wiz_coin(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate Alert Wizard: Step 2 Alert Type / 1-Tap Percentages."""
+    symbol = normalize_symbol(coin)
+    coin_safe = _escape_md(coin.upper())
+    price = await get_current_price(symbol)
+    if price is None and engine:
+        price = engine.get_fresh_price(symbol, max_age_sec=30)
+    if price is None:
+        price = cached_price(symbol, max_age_sec=120)
+
+    lines = [
+        f"🎯 *Set Alert for {coin_safe}*",
+        f"Current Price: *{format_price(price) if price else 'N/A'}*",
+        "",
+        "Choose an alert type or 1-tap percentage:",
+    ]
+    kb = [
+        [
+            InlineKeyboardButton("🎯 Custom Price", callback_data=f"wiz_type_{coin}_custom"),
+            InlineKeyboardButton("🚨 Emergency Siren", callback_data=f"wiz_type_{coin}_siren"),
+        ],
+        [
+            InlineKeyboardButton("📈 +2% Quick", callback_data=f"wiz_add_pct_{coin}_2"),
+            InlineKeyboardButton("📈 +5% Quick", callback_data=f"wiz_add_pct_{coin}_5"),
+        ],
+        [
+            InlineKeyboardButton("📉 -2% Quick", callback_data=f"wiz_add_pct_{coin}_-2"),
+            InlineKeyboardButton("📉 -5% Quick", callback_data=f"wiz_add_pct_{coin}_-5"),
+        ],
+        [
+            InlineKeyboardButton("🪢 Trailing Stop", callback_data=f"wiz_trail_{coin}"),
+            InlineKeyboardButton("⚡ Volatility Move", callback_data=f"wiz_move_{coin}"),
+        ],
+        [
+            InlineKeyboardButton("📐 Grid Range", callback_data=f"wiz_grid_{coin}"),
+            InlineKeyboardButton("🔙 Back to Coins", callback_data="wiz_start"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_wiz_trail(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate Trailing Stop wizard presets."""
+    lines = [
+        f"🪢 *Trailing Stop Alert for {coin.upper()}*",
+        "Alerts when price pulls back by X% from its highest peak:",
+    ]
+    kb = [
+        [InlineKeyboardButton("Trail 2%", callback_data=f"wiz_add_trail_{coin}_2"), InlineKeyboardButton("Trail 3%", callback_data=f"wiz_add_trail_{coin}_3")],
+        [InlineKeyboardButton("Trail 5%", callback_data=f"wiz_add_trail_{coin}_5"), InlineKeyboardButton("Trail 10%", callback_data=f"wiz_add_trail_{coin}_10")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"wiz_coin_{coin}")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_wiz_move(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate Volatility Move wizard presets."""
+    lines = [
+        f"⚡ *Volatility Move Alert for {coin.upper()}*",
+        "Alerts on rapid price surges or drops within a time window:",
+    ]
+    kb = [
+        [InlineKeyboardButton("3% in 15m", callback_data=f"wiz_add_move_{coin}_3_15"), InlineKeyboardButton("5% in 1h", callback_data=f"wiz_add_move_{coin}_5_60")],
+        [InlineKeyboardButton("7% in 4h", callback_data=f"wiz_add_move_{coin}_7_240"), InlineKeyboardButton("10% in 24h", callback_data=f"wiz_add_move_{coin}_10_1440")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"wiz_coin_{coin}")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_wiz_grid(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Generate Grid Range wizard presets."""
+    symbol = normalize_symbol(coin)
+    price = await get_current_price(symbol)
+    if price is None and engine:
+        price = engine.get_fresh_price(symbol, max_age_sec=30)
+    if price is None:
+        price = cached_price(symbol, max_age_sec=120)
+
+    lines = [
+        f"📐 *Price Grid Setup for {coin.upper()}*",
+        f"Current Price: *{format_price(price) if price else 'N/A'}*",
+        "",
+        "Instantly deploy laddered alerts above and below market:",
+    ]
+    kb = [
+        [
+            InlineKeyboardButton("±2% Range (5 levels)", callback_data=f"grid_preset_{coin}_2_5"),
+            InlineKeyboardButton("±5% Range (5 levels)", callback_data=f"grid_preset_{coin}_5_5"),
+        ],
+        [
+            InlineKeyboardButton("±10% Range (7 levels)", callback_data=f"grid_preset_{coin}_10_7"),
+            InlineKeyboardButton("±20% Range (9 levels)", callback_data=f"grid_preset_{coin}_20_9"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Back", callback_data=f"wiz_coin_{coin}"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
+
+
+async def _render_alert_editor(alert_id: int) -> tuple[str, InlineKeyboardMarkup] | None:
+    """Generate the rich interactive Alert Editor deck."""
+    alert = await db.get_alert(alert_id)
+    if not alert:
+        return None
+    symbol = db.alert_field(alert, "symbol", "")
+    target = db.alert_field(alert, "target", 0)
+    condition = db.alert_field(alert, "condition", "above")
+    is_persistent = bool(db.alert_field(alert, "is_persistent", 0))
+    is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
+    atype = db.alert_field(alert, "alert_type", "price") or "price"
+    snoozed = db.alert_field(alert, "snoozed_until")
+    coin = _escape_md(symbol.replace("USDT", ""))
+
+    lines = [
+        f"⚙️ *Manage Alert #{alert_id}*",
+        f"• Coin: *{coin}*",
+        f"• Target: *{condition.upper()}* `{format_price(target)}`",
+        f"• Mode: {'🔁 Repeat' if is_persistent else '🎯 Once'}",
+        f"• Siren: {'🚨 ENABLED (Loud)' if is_urgent else '🔕 Standard'}",
+    ]
+    if snoozed:
+        lines.append(f"• Snooze: *till {_fmt_ts(snoozed)}*")
+
+    lines.append("\n_Tap an action to adjust this alert:_")
+
+    siren_btn = InlineKeyboardButton(
+        "🔕 Turn Off Siren" if is_urgent else "🚨 Turn On Siren",
+        callback_data=f"toggle_urgent_{alert_id}"
+    )
+    repeat_btn = InlineKeyboardButton(
+        "🎯 Make Once" if is_persistent else "🔁 Make Repeat",
+        callback_data=f"toggle_repeat_{alert_id}"
+    )
+    flip_btn = InlineKeyboardButton(
+        f"🔄 Flip to {'BELOW' if condition == 'above' else 'ABOVE'}",
+        callback_data=f"edit_flip_{alert_id}"
+    )
+
+    kb = [
+        [
+            InlineKeyboardButton("➕ +1%", callback_data=f"edittgt_{alert_id}_1"),
+            InlineKeyboardButton("➕ +5%", callback_data=f"edittgt_{alert_id}_5"),
+            InlineKeyboardButton("➖ -1%", callback_data=f"edittgt_{alert_id}_-1"),
+            InlineKeyboardButton("➖ -5%", callback_data=f"edittgt_{alert_id}_-5"),
+        ],
+        [
+            flip_btn,
+            InlineKeyboardButton("✏️ Custom Price", callback_data=f"edit_custom_{alert_id}"),
+        ],
+        [
+            siren_btn,
+            repeat_btn,
+        ],
+        [
+            InlineKeyboardButton("🔕 Snooze 1h", callback_data=f"snooze_{alert_id}_1h"),
+            InlineKeyboardButton("4h", callback_data=f"snooze_{alert_id}_4h"),
+            InlineKeyboardButton("24h", callback_data=f"snooze_{alert_id}_24h"),
+        ],
+        [
+            InlineKeyboardButton("❌ Delete Alert", callback_data=f"remove_{alert_id}"),
+            InlineKeyboardButton("📋 Back to List", callback_data="hub_alerts"),
+        ],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(kb)
 
 
 async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = None,
@@ -235,7 +685,13 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
     if not alerts:
         coin = filt.replace("USDT", "") if filt else ""
         hint = f"No active alerts{f' for {coin}' if filt else ''}."
-        return hint + "\n\nTap Add Alert to create one.", None
+        kb = [
+            [
+                InlineKeyboardButton("➕ Set Alert", callback_data="wiz_start"),
+                InlineKeyboardButton("🔙 Hub", callback_data="hub_main"),
+            ]
+        ]
+        return hint + "\n\nTap Set Alert to create one.", InlineKeyboardMarkup(kb)
 
     total_pages = max(1, (len(alerts) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
@@ -275,8 +731,8 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
         flag_txt = f" [{', '.join(flags)}]" if flags else " [once]"
         lines.append(f"  #{alert_id}{flag_txt} *{coin}* {desc}")
         keyboard.append([
-            InlineKeyboardButton(f"Edit #{alert_id}", callback_data=f"edit_{alert_id}"),
-            InlineKeyboardButton(f"Remove #{alert_id}", callback_data=f"remove_{alert_id}"),
+            InlineKeyboardButton(f"⚙️ Edit #{alert_id}", callback_data=f"edit_{alert_id}"),
+            InlineKeyboardButton(f"❌ Remove #{alert_id}", callback_data=f"remove_{alert_id}"),
         ])
 
     lines.append("")
@@ -305,7 +761,11 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
         nav.append(InlineKeyboardButton("Next >", callback_data=f"list_{page + 1}{tag}"))
     if nav:
         keyboard.append(nav)
-    keyboard.append([InlineKeyboardButton("Refresh List", callback_data=f"refresh_list_{page}{tag}")])
+    keyboard.append([
+        InlineKeyboardButton("➕ Set Alert", callback_data="wiz_start"),
+        InlineKeyboardButton("Refresh List", callback_data=f"refresh_list_{page}{tag}"),
+        InlineKeyboardButton("🔙 Hub", callback_data="hub_main"),
+    ])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
@@ -796,8 +1256,39 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 @authorized
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dashboard, /menu, /hub — open interactive command center."""
+    engine = context.bot_data["engine"]
+    text, markup = await _render_dashboard(engine)
+    if update.message:
+        await update.message.reply_text(
+            text, parse_mode="Markdown", reply_markup=markup
+        )
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode="Markdown", reply_markup=markup
+            )
+        except Exception:
+            pass
+
+
+@authorized
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — welcome user, initialize 4-button persistent reply keyboard, and open dashboard."""
+    engine = context.bot_data["engine"]
+    if update.message:
+        await update.message.reply_text(
+            "⚡ *Welcome to Crypto Alerts Command Center!*",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(engine),
+        )
+    await cmd_dashboard(update, context)
+
+
+@authorized
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/help or /start — show available commands."""
+    """/help — show available commands."""
     engine = context.bot_data["engine"]
     if not config.TELEGRAM_USER_ID:
         await update.message.reply_text(
@@ -860,8 +1351,21 @@ def _parse_duration(text: str):
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/edit <id> <price> [above|below]."""
     args = context.args or []
+    if len(args) == 1:
+        try:
+            aid = int(args[0])
+            ed_res = await _render_alert_editor(aid)
+            if ed_res:
+                txt, markup = ed_res
+                await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=markup)
+                return
+            else:
+                await update.message.reply_text(f"Alert #{aid} not found.")
+                return
+        except ValueError:
+            pass
     if len(args) < 2:
-        await update.message.reply_text("Usage: `/edit 3 76000 above`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/edit <id>` or `/edit <id> <price> [above|below]`", parse_mode="Markdown")
         return
     try:
         alert_id = int(args[0])
@@ -1505,11 +2009,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     engine = context.bot_data["engine"]
     text = (update.message.text or "").strip()
 
-    # State machine for Custom Price Wizard
+    # State 1: Editing target price from Alert Editor deck
+    editing_id = context.user_data.get("editing_alert_target")
+    if editing_id:
+        context.user_data.pop("editing_alert_target", None)
+        try:
+            val = float(text.replace(",", "").strip())
+            if not (0 < val <= MAX_PRICE_VALUE):
+                await update.message.reply_text("Price is out of range.")
+                return
+            alert = await db.get_alert(editing_id)
+            if not alert:
+                await update.message.reply_text(f"Alert #{editing_id} not found.")
+                return
+            condition = db.alert_field(alert, "condition", "above")
+            await db.set_target(editing_id, val, condition)
+            ed_res = await _render_alert_editor(editing_id)
+            if ed_res:
+                txt, kb = ed_res
+                await update.message.reply_text(
+                    f"✅ Alert #{editing_id} target updated to *{format_price(val)}*.\n\n" + txt,
+                    parse_mode="Markdown",
+                    reply_markup=kb,
+                )
+            else:
+                await update.message.reply_text(f"Alert #{editing_id} target updated to {format_price(val)}.")
+            return
+        except ValueError:
+            await update.message.reply_text("Invalid price format. Edit cancelled.")
+            return
+
+    # State 2: Adding a custom coin to Watchlist
+    if context.user_data.get("awaiting_watch_coin"):
+        context.user_data.pop("awaiting_watch_coin", None)
+        sym = normalize_symbol(text)
+        if is_valid_symbol(sym):
+            p = await get_current_price(sym)
+            if p is None and engine:
+                p = engine.get_fresh_price(sym, max_age_sec=30)
+            if p is not None:
+                await db.add_watch(sym)
+                ws = context.bot_data.get("ws")
+                if ws:
+                    await ws.subscribe(sym)
+                coin_clean = sym.replace("USDT", "")
+                await update.message.reply_text(f"✅ Added *{coin_clean}* to watchlist!", parse_mode="Markdown")
+                txt, kb = await _render_watch_deck(engine)
+                await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+                return
+        await update.message.reply_text(f"Could not find valid coin `{_escape_md(text)}`.", parse_mode="Markdown")
+        return
+
+    # State 3: Custom Price Wizard
     awaiting_coin = context.user_data.get("awaiting_custom_price")
     if awaiting_coin:
-        menu_labels = ("My Alerts", "List Alerts", "Prices", "Check Price", "Add Alert",
-                       "Remove Alert", "Pause", "Resume", "Pause Alerts", "Resume Alerts",
+        menu_labels = ("Dashboard", "My Alerts", "List Alerts", "Prices", "Check Price", "Add Alert",
+                       "Set Alert", "Remove Alert", "Pause", "Resume", "Pause Alerts", "Resume Alerts",
                        "Help", "Movers", "History")
         if any(label in text for label in menu_labels) or text.startswith("/"):
             context.user_data.pop("awaiting_custom_price", None)  # Cancel wizard
@@ -1604,35 +2159,66 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     # Normal Main Menu
-    if text in ("📋 My Alerts", "📋 List Alerts", "My Alerts", "List Alerts"):
+    if text in ("⚡ Dashboard", "Dashboard", "Home", "Menu", "⚡"):
+        text_dash, kb_dash = await _render_dashboard(engine)
+        await update.message.reply_text(text_dash, parse_mode="Markdown", reply_markup=kb_dash)
+        return
+    elif text in ("➕ Set Alert", "Set Alert", "➕ Add Alert", "Add Alert"):
+        txt_wiz, kb_wiz = await _render_wiz_start()
+        await update.message.reply_text(txt_wiz, parse_mode="Markdown", reply_markup=kb_wiz)
+        return
+    elif text in ("📋 My Alerts", "📋 List Alerts", "My Alerts", "List Alerts"):
         await cmd_list(update, context)
-    elif text in ("❓ Help", "Help"):
-        await cmd_help(update, context)
-    elif text in ("➕ Add Alert", "Add Alert"):
-        kb = [
-            [InlineKeyboardButton("BTC", callback_data="addwiz_coin_BTC"), InlineKeyboardButton("ETH", callback_data="addwiz_coin_ETH")],
-            [InlineKeyboardButton("SOL", callback_data="addwiz_coin_SOL"), InlineKeyboardButton("HYPE", callback_data="addwiz_coin_HYPE")]
-        ]
-        await update.message.reply_text("Select a coin to set an alert for:", reply_markup=InlineKeyboardMarkup(kb))
+        return
     elif text in ("💰 Prices", "💰 Check Price", "Check Price", "Prices: All", "Prices"):
         await _send_all_prices(update.message, engine)
+        return
+    elif text in ("📊 Movers", "Movers", "Top Movers"):
+        txt_m, kb_m = await _render_movers_deck()
+        await update.message.reply_text(txt_m, parse_mode="Markdown", reply_markup=kb_m)
+        return
     elif text in ("⏸️ Pause", "⏸️ Pause Alerts", "Pause Alerts", "Pause"):
-        engine.pause_alerts(config.PAUSE_DURATION_HOURS)
-        await update.message.reply_text(f"Alerts paused for {config.PAUSE_DURATION_HOURS} hour(s).", reply_markup=get_main_keyboard(engine))
+        txt_p, kb_p = await _render_pause_deck(engine)
+        await update.message.reply_text(txt_p, parse_mode="Markdown", reply_markup=kb_p)
+        return
     elif text in ("▶️ Resume", "▶️ Resume Alerts", "Resume Alerts", "Resume"):
         engine.resume_alerts()
         await update.message.reply_text("Alerts resumed.", reply_markup=get_main_keyboard(engine))
-    elif text in ("📊 Movers", "Movers", "Top Movers"):
-        await cmd_movers(update, context)
+        return
     elif text in ("📜 History", "History"):
         await cmd_history(update, context)
-    elif text in ("Watchlist",):
-        await cmd_watchlist(update, context)
+        return
+    elif text in ("Watchlist", "👁️ Watchlist"):
+        txt_w, kb_w = await _render_watch_deck(engine)
+        await update.message.reply_text(txt_w, parse_mode="Markdown", reply_markup=kb_w)
+        return
+    elif text in ("❓ Help", "Help"):
+        await cmd_help(update, context)
+        return
     elif text in ("❌ Remove Alert", "Remove Alert"):
         await update.message.reply_text("Tap *My Alerts* to see inline delete buttons for each alert.", parse_mode="Markdown")
-    elif text and not text.startswith("/"):
-        # Unknown free text outside the wizard — guide back to the menu.
-        await update.message.reply_text("Use the menu buttons below, or /help for commands.", reply_markup=get_main_keyboard(engine))
+        return
+
+    # Check for bare coin symbol (e.g. "SOL", "BTC", "ETH", "DOGE") -> open Action Card!
+    clean_sym = text.strip().lstrip("$").upper().replace("/", "").replace("-", "")
+    if clean_sym and " " not in clean_sym and len(clean_sym) <= 12 and not text.startswith("/"):
+        normalized = normalize_symbol(clean_sym)
+        if is_valid_symbol(normalized):
+            p = await get_current_price(normalized)
+            if p is None and engine:
+                p = engine.get_fresh_price(normalized, max_age_sec=30)
+            if p is None:
+                p = cached_price(normalized, max_age_sec=120)
+            if p is not None:
+                await _show_coin_card(update.message, normalized, engine)
+                return
+
+    if text and not text.startswith("/"):
+        await update.message.reply_text(
+            "Tap a menu button below, or type any coin name (e.g. `SOL`, `BTC`, `DOGE`) to open its action card.",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(engine)
+        )
 
 
 @authorized
@@ -1645,6 +2231,344 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pass
     data = query.data or ""
     engine = context.bot_data["engine"]
+
+    if data == "hub_main":
+        txt, kb = await _render_dashboard(engine)
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_refresh":
+        await query.answer("⚡ Dashboard updated!")
+        txt, kb = await _render_dashboard(engine)
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_alerts":
+        txt, kb = await get_list_text_and_markup(engine)
+        try:
+            if kb:
+                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await query.edit_message_text(txt, parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    if data == "hub_movers":
+        txt, kb = await _render_movers_deck()
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_watch":
+        txt, kb = await _render_watch_deck(engine)
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_pause":
+        txt, kb = await _render_pause_deck(engine)
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_tools":
+        ws = context.bot_data.get("ws")
+        txt, kb = await _render_tools_deck(engine, ws)
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_charts":
+        txt, kb = await _render_charts_hub()
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_grid":
+        txt, kb = await _render_wiz_start()
+        try:
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+        return
+
+    if data == "hub_history":
+        await cmd_history(update, context)
+        return
+
+    if data == "hub_health":
+        await cmd_health(update, context)
+        return
+
+    if data == "hub_backup":
+        await cmd_backup(update, context)
+        return
+
+    if data == "hub_export":
+        await cmd_export(update, context)
+        return
+
+    if data == "hub_update":
+        await cmd_update(update, context)
+        return
+
+    if data.startswith("coin_card_"):
+        coin = data[len("coin_card_"):]
+        await _show_coin_card(query, coin, engine)
+        return
+
+    if data.startswith("watch_toggle_"):
+        coin = data[len("watch_toggle_"):]
+        sym = normalize_symbol(coin)
+        is_now = await db.toggle_watch(sym)
+        ws = context.bot_data.get("ws")
+        if ws and is_now:
+            await ws.subscribe(sym)
+        await query.answer(f"{'Added to' if is_now else 'Removed from'} watchlist!")
+        await _show_coin_card(query, coin, engine)
+        return
+
+    if data == "watch_add_wiz":
+        context.user_data["awaiting_watch_coin"] = True
+        kb = [
+            [InlineKeyboardButton("+DOGE", callback_data="watch_add_quick_DOGE"), InlineKeyboardButton("+XRP", callback_data="watch_add_quick_XRP")],
+            [InlineKeyboardButton("+PEPE", callback_data="watch_add_quick_PEPE"), InlineKeyboardButton("+ADA", callback_data="watch_add_quick_ADA")],
+            [InlineKeyboardButton("+AVAX", callback_data="watch_add_quick_AVAX"), InlineKeyboardButton("+LINK", callback_data="watch_add_quick_LINK")],
+            [InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")],
+        ]
+        await query.edit_message_text(
+            "➕ *Add to Watchlist*\n\nTap a popular coin below or type any ticker in chat (e.g. `NEAR`):",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    if data.startswith("watch_add_quick_"):
+        coin = data[len("watch_add_quick_"):]
+        sym = normalize_symbol(coin)
+        await db.add_watch(sym)
+        ws = context.bot_data.get("ws")
+        if ws:
+            await ws.subscribe(sym)
+        await query.answer(f"Added {coin} to watchlist!")
+        txt, kb = await _render_watch_deck(engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data == "watch_del_wiz":
+        watch = await _effective_watchlist()
+        kb = [[InlineKeyboardButton(f"❌ Remove {s.replace('USDT', '')}", callback_data=f"watch_remove_{s.replace('USDT', '')}")] for s in watch]
+        kb.append([InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")])
+        await query.edit_message_text(
+            "🗑️ *Select a coin to remove from watchlist:*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    if data.startswith("watch_remove_"):
+        coin = data[len("watch_remove_"):]
+        sym = normalize_symbol(coin)
+        await db.remove_watch(sym)
+        await query.answer(f"Removed {coin} from watchlist.")
+        txt, kb = await _render_watch_deck(engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data.startswith("pause_dur_"):
+        dur = data[len("pause_dur_"):]
+        secs = _parse_duration(dur) or 3600
+        engine.pause_alerts(secs / 3600)
+        await query.answer(f"Alerts paused for {dur}!")
+        txt, kb = await _render_pause_deck(engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data == "pause_resume":
+        engine.resume_alerts()
+        await query.answer("Alerts resumed! 🔔")
+        txt, kb = await _render_dashboard(engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data == "wiz_start":
+        txt, kb = await _render_wiz_start()
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data.startswith("wiz_coin_"):
+        coin = data[len("wiz_coin_"):]
+        txt, kb = await _render_wiz_coin(coin, engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data.startswith("wiz_trail_"):
+        coin = data[len("wiz_trail_"):]
+        txt, kb = await _render_wiz_trail(coin, engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data.startswith("wiz_move_"):
+        coin = data[len("wiz_move_"):]
+        txt, kb = await _render_wiz_move(coin, engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data.startswith("wiz_grid_"):
+        coin = data[len("wiz_grid_"):]
+        txt, kb = await _render_wiz_grid(coin, engine)
+        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if data.startswith("wiz_add_pct_"):
+        parts = data.split("_")
+        coin = parts[3].upper()
+        pct = float(parts[4])
+        sym = normalize_symbol(coin)
+        price = await get_current_price(sym)
+        if price is None and engine:
+            price = engine.get_fresh_price(sym, max_age_sec=30)
+        if not price:
+            await query.answer("Could not get current price.", show_alert=True)
+            return
+        cond = "above" if pct > 0 else "below"
+        tgt = price * (1 + pct / 100)
+        aid = await db.add_alert(sym, tgt, cond, True, alert_type="price")
+        ws = context.bot_data.get("ws")
+        if ws:
+            await ws.subscribe(sym)
+        await query.answer(f"✅ Alert #{aid} created!")
+        kb = [
+            [InlineKeyboardButton("➕ Set Another Alert", callback_data="wiz_start"),
+             InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts")],
+            [InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
+        ]
+        await query.edit_message_text(
+            f"✅ *Alert #{aid} created for {_escape_md(coin)}!*\n\n"
+            f"• Target: *{cond.upper()} {format_price(tgt)}* ({pct:+.0f}%)\n"
+            f"• Mode: Repeat\n"
+            f"• Current Price: {format_price(price)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    if data.startswith("wiz_add_trail_"):
+        parts = data.split("_")
+        coin = parts[3].upper()
+        pct = float(parts[4])
+        sym = normalize_symbol(coin)
+        price = await get_current_price(sym)
+        if price is None and engine:
+            price = engine.get_fresh_price(sym, max_age_sec=30)
+        if not price:
+            await query.answer("Could not get current price.", show_alert=True)
+            return
+        aid = await db.add_alert(sym, price, "below", True, alert_type="trail", pct=pct, base_price=price, peak_price=price)
+        ws = context.bot_data.get("ws")
+        if ws:
+            await ws.subscribe(sym)
+        await query.answer(f"✅ Trailing Stop #{aid} created!")
+        kb = [
+            [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
+             InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
+        ]
+        await query.edit_message_text(
+            f"✅ *Trailing Stop #{aid} created for {_escape_md(coin)}!*\n\n"
+            f"• Pullback: *{pct}% from peak*\n"
+            f"• Current Price: {format_price(price)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    if data.startswith("wiz_add_move_"):
+        parts = data.split("_")
+        coin = parts[3].upper()
+        pct = float(parts[4])
+        win = int(parts[5])
+        sym = normalize_symbol(coin)
+        price = await get_current_price(sym)
+        if price is None and engine:
+            price = engine.get_fresh_price(sym, max_age_sec=30)
+        if not price:
+            await query.answer("Could not get current price.", show_alert=True)
+            return
+        aid = await db.add_alert(sym, price, "above", True, alert_type="move", pct=pct, window_min=win, base_price=price, peak_price=price)
+        ws = context.bot_data.get("ws")
+        if ws:
+            await ws.subscribe(sym)
+        await query.answer(f"✅ Move Alert #{aid} created!")
+        kb = [
+            [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
+             InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
+        ]
+        await query.edit_message_text(
+            f"✅ *Move Alert #{aid} created for {_escape_md(coin)}!*\n\n"
+            f"• Trigger: *{pct}% move within {win}m*\n"
+            f"• Current Price: {format_price(price)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    if data.startswith("grid_preset_"):
+        parts = data.split("_")
+        coin = parts[2].upper()
+        spread = float(parts[3])
+        levels = int(parts[4])
+        sym = normalize_symbol(coin)
+        price = await get_current_price(sym)
+        if price is None and engine:
+            price = engine.get_fresh_price(sym, max_age_sec=30)
+        if not price:
+            await query.answer("Could not get current price.", show_alert=True)
+            return
+        low = price * (1 - spread / 100)
+        high = price * (1 + spread / 100)
+        step = (high - low) / (levels - 1)
+        grid_prices = [low + i * step for i in range(levels)]
+        ws = context.bot_data.get("ws")
+        added_ids = []
+        for p_tgt in grid_prices:
+            cond = "above" if p_tgt > price else "below"
+            if abs(p_tgt - price) / price < 0.0001:
+                continue
+            aid = await db.add_alert(sym, p_tgt, cond, True, alert_type="price")
+            added_ids.append(aid)
+        if ws:
+            await ws.subscribe(sym)
+        await query.answer(f"✅ Grid deployed with {len(added_ids)} alerts!")
+        kb = [
+            [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
+             InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
+        ]
+        await query.edit_message_text(
+            f"🌐 *Grid deployed for {_escape_md(coin)}!*\n\n"
+            f"• Deployed {len(added_ids)} alerts between *{format_price(low)}* and *{format_price(high)}*\n"
+            f"• Spread: ±{spread:g}%\n"
+            f"• Current Price: {format_price(price)}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
 
     if data == "prices_all":
         await _send_all_prices(query, engine, context=context)
@@ -1794,95 +2718,115 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             pass
         return
 
-    if data.startswith("edit_"):
+    if data.startswith("edit_custom_"):
         try:
-            alert_id = int(data.split("_")[1])
-        except (ValueError, IndexError):
-            return
-        alert = await db.get_alert(alert_id)
-        if not alert:
-            try:
-                await query.edit_message_text(f"Alert #{alert_id} not found.", reply_markup=None)
-            except Exception:
-                pass
-            return
-        coin = _escape_md(db.alert_field(alert, "symbol", "").replace("USDT", ""))
-        is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
-        siren_btn = (
-            InlineKeyboardButton("🔕 Turn OFF Siren", callback_data=f"toggle_urgent_{alert_id}")
-            if is_urgent
-            else InlineKeyboardButton("🚨 Turn ON Siren", callback_data=f"toggle_urgent_{alert_id}")
-        )
-        kb = [
-            [InlineKeyboardButton("Snooze 12h", callback_data=f"snooze_{alert_id}_12h"),
-             InlineKeyboardButton("Snooze 24h", callback_data=f"snooze_{alert_id}_24h")],
-            [siren_btn],
-            [InlineKeyboardButton("Remove", callback_data=f"remove_{alert_id}")]
-        ]
-        urgent_badge = " [🚨 URGENT]" if is_urgent else ""
-        try:
+            alert_id = int(data.split("_")[2])
+            context.user_data["editing_alert_target"] = alert_id
             await query.edit_message_text(
-                f"*{coin}* #{alert_id}{urgent_badge} — what do you want to do?",
-                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb),
+                f"✏️ *Editing Target Price for Alert #{alert_id}*\n\n"
+                f"Please reply with the new target price in chat (e.g. `74500` or `152.5`):",
+                parse_mode="Markdown",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            await query.answer(f"Error: {e}")
+        return
+
+    if data.startswith("edittgt_"):
+        parts = data.split("_")
+        if len(parts) >= 3:
+            try:
+                aid = int(parts[1])
+                delta = float(parts[2])
+                alert = await db.get_alert(aid)
+                if alert:
+                    cur_tgt = db.alert_field(alert, "target", 0)
+                    cond = db.alert_field(alert, "condition", "above")
+                    new_tgt = cur_tgt * (1 + delta / 100)
+                    await db.set_target(aid, new_tgt, cond)
+                    await query.answer(f"Target set to {format_price(new_tgt)} ({delta:+.0f}%)")
+                    res = await _render_alert_editor(aid)
+                    if res:
+                        await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+            except Exception as e:
+                await query.answer(f"Error: {e}")
+        return
+
+    if data.startswith("edit_flip_"):
+        try:
+            aid = int(data.split("_")[2])
+            alert = await db.get_alert(aid)
+            if alert:
+                cur_tgt = db.alert_field(alert, "target", 0)
+                cond = db.alert_field(alert, "condition", "above")
+                new_cond = "below" if cond == "above" else "above"
+                await db.set_target(aid, cur_tgt, new_cond)
+                await query.answer(f"Condition flipped to {new_cond.upper()}!")
+                res = await _render_alert_editor(aid)
+                if res:
+                    await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+        except Exception as e:
+            await query.answer(f"Error: {e}")
+        return
+
+    if data.startswith("toggle_repeat_"):
+        try:
+            aid = int(data.split("_")[2])
+            new_val = await db.toggle_persistent(aid)
+            await query.answer(f"Repeat {'ENABLED' if new_val else 'DISABLED'}")
+            res = await _render_alert_editor(aid)
+            if res:
+                await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+        except Exception as e:
+            await query.answer(f"Error: {e}")
         return
 
     if data.startswith("toggle_urgent_"):
         try:
             alert_id = int(data.split("_")[2])
-        except (ValueError, IndexError):
-            return
-        new_state = await db.toggle_urgent(alert_id)
-        if new_state is None:
-            await query.answer("Alert not found.", show_alert=True)
-            return
-        status_str = "🚨 Emergency Siren ENABLED" if new_state else "🔕 Siren DISABLED"
-        await query.answer(status_str)
-        alert = await db.get_alert(alert_id)
-        if alert:
-            coin = _escape_md(db.alert_field(alert, "symbol", "").replace("USDT", ""))
-            is_urgent = bool(db.alert_field(alert, "is_urgent", 0))
-            siren_btn = (
-                InlineKeyboardButton("🔕 Turn OFF Siren", callback_data=f"toggle_urgent_{alert_id}")
-                if is_urgent
-                else InlineKeyboardButton("🚨 Turn ON Siren", callback_data=f"toggle_urgent_{alert_id}")
-            )
-            kb = [
-                [InlineKeyboardButton("Snooze 12h", callback_data=f"snooze_{alert_id}_12h"),
-                 InlineKeyboardButton("Snooze 24h", callback_data=f"snooze_{alert_id}_24h")],
-                [siren_btn],
-                [InlineKeyboardButton("Remove", callback_data=f"remove_{alert_id}")]
-            ]
-            urgent_badge = " [🚨 URGENT]" if is_urgent else ""
-            try:
-                await query.edit_message_text(
-                    f"*{coin}* #{alert_id}{urgent_badge} — what do you want to do?",
-                    parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb),
-                )
-            except Exception:
-                pass
+            new_state = await db.toggle_urgent(alert_id)
+            if new_state is None:
+                await query.answer("Alert not found.", show_alert=True)
+                return
+            status_str = "🚨 Emergency Siren ENABLED" if new_state else "🔕 Siren DISABLED"
+            await query.answer(status_str)
+            res = await _render_alert_editor(alert_id)
+            if res:
+                await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+        except Exception as e:
+            await query.answer(f"Error: {e}")
         return
 
     if data.startswith("snooze_"):
         parts = data.split("_")
-        if len(parts) != 3:
-            return
+        if len(parts) == 3:
+            try:
+                alert_id = int(parts[1])
+                hours = int(parts[2].rstrip("h"))
+                until = db.iso_in(hours=hours)
+                await db.set_snooze(alert_id, until)
+                await query.answer(f"🔕 Snoozed for {hours}h!")
+                res = await _render_alert_editor(alert_id)
+                if res:
+                    await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+                return
+            except ValueError:
+                pass
+
+    if data.startswith("edit_"):
         try:
-            alert_id = int(parts[1])
-            hours = int(parts[2].rstrip("h"))
-        except ValueError:
+            alert_id = int(data.split("_")[1])
+        except (ValueError, IndexError):
             return
-        if not await db.get_alert(alert_id):
+        res = await _render_alert_editor(alert_id)
+        if not res:
+            try:
+                await query.edit_message_text(f"Alert #{alert_id} not found.", reply_markup=None)
+            except Exception:
+                pass
             return
-        import datetime as _dt
-        until = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
-        await db.set_snooze(alert_id, until)
+        txt, kb = res
         try:
-            text, markup = await get_list_text_and_markup(engine)
-            await query.edit_message_text(f"Alert #{alert_id} snoozed for {hours}h.\n\n" + text,
-                                          parse_mode="Markdown", reply_markup=markup or None)
+            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
         except Exception:
             pass
         return
@@ -1976,7 +2920,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception:
             pass
 
-    elif data.startswith("addwiz_type_"):
+    elif data.startswith("addwiz_type_") or data.startswith("wiz_type_"):
         parts = data.split("_")
         if len(parts) != 4:
             return
@@ -2036,7 +2980,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
             except Exception:
                 pass
-        elif atype == "custom":
+        elif atype in ("custom", "target"):
             context.user_data["awaiting_custom_price"] = coin
             context.user_data.pop("is_urgent", None)
             coin_safe = _escape_md(coin)
@@ -2059,7 +3003,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def _post_init(application: Application) -> None:
     """Register command suggestions in Telegram UI autocomplete."""
     commands = [
-        BotCommand("start", "Show interactive menu & buttons"),
+        BotCommand("start", "Open Interactive Command Center"),
+        BotCommand("dashboard", "Open Command Center Dashboard"),
+        BotCommand("menu", "Interactive quick menu"),
         BotCommand("help", "Show help & full command list"),
         BotCommand("add", "Add a price alert (e.g. /add BTC 70000)"),
         BotCommand("urgent", "Create emergency siren alert (loud sound + max priority)"),
@@ -2101,7 +3047,10 @@ def create_bot(alert_engine, binance_ws) -> Application:
     app.bot_data["engine"] = alert_engine
     app.bot_data["ws"] = binance_ws
 
-    app.add_handler(CommandHandler("start", cmd_help))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
+    app.add_handler(CommandHandler("menu", cmd_dashboard))
+    app.add_handler(CommandHandler("hub", cmd_dashboard))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("urgent", cmd_urgent))

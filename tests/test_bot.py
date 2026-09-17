@@ -1124,6 +1124,144 @@ class TestWebhookServer(unittest.TestCase):
         _run(go())
 
 
+class TestUIRedesign(unittest.TestCase):
+    def test_main_keyboard_streamlined(self):
+        from telegram_bot import get_main_keyboard
+        kb = get_main_keyboard()
+        buttons = [btn.text for row in kb.keyboard for btn in row]
+        self.assertEqual(len(buttons), 4)
+        self.assertIn("⚡ Dashboard", buttons)
+        self.assertIn("➕ Set Alert", buttons)
+        self.assertIn("💰 Prices", buttons)
+        self.assertIn("📋 My Alerts", buttons)
+
+    def test_database_toggles(self):
+        async def go():
+            import database as db
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                aid = await db.add_alert("BTCUSDT", 70000, "above", is_persistent=False)
+                # Test toggle_persistent
+                new_val = await db.toggle_persistent(aid)
+                self.assertTrue(new_val)
+                alert = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert, "is_persistent"), 1)
+
+                new_val2 = await db.toggle_persistent(aid)
+                self.assertFalse(new_val2)
+                alert2 = await db.get_alert(aid)
+                self.assertEqual(db.alert_field(alert2, "is_persistent"), 0)
+
+                # Test watchlist toggles
+                self.assertFalse(await db.is_watched("SOLUSDT"))
+                self.assertTrue(await db.toggle_watch("SOLUSDT"))
+                self.assertTrue(await db.is_watched("SOLUSDT"))
+                self.assertFalse(await db.toggle_watch("SOLUSDT"))
+                self.assertFalse(await db.is_watched("SOLUSDT"))
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_render_decks_and_cards(self):
+        async def go():
+            import database as db
+            from telegram_bot import (
+                _render_dashboard, _show_coin_card, _render_movers_deck,
+                _render_watch_deck, _render_pause_deck, _render_tools_deck,
+                _render_charts_hub, _render_wiz_start, _render_wiz_coin,
+                _render_alert_editor
+            )
+            from unittest.mock import AsyncMock, MagicMock, patch
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                aid = await db.add_alert("SOLUSDT", 150.0, "above", is_persistent=True, is_urgent=True)
+                mock_engine = MagicMock()
+                mock_engine.is_muted.return_value = False
+                mock_engine.get_stats.return_value = {"checks": 10, "triggered": 1}
+                mock_engine.get_fresh_price.return_value = 145.0
+
+                # 1. Dashboard
+                text, markup = await _render_dashboard(mock_engine)
+                self.assertIn("CRYPTO COMMAND CENTER", text)
+                cb_data = [btn.callback_data for row in markup.inline_keyboard for btn in row if btn.callback_data]
+                self.assertIn("wiz_start", cb_data)
+                self.assertIn("hub_alerts", cb_data)
+                self.assertIn("hub_movers", cb_data)
+                self.assertIn("hub_charts", cb_data)
+                self.assertIn("hub_watch", cb_data)
+                self.assertIn("hub_tools", cb_data)
+                self.assertIn("hub_refresh", cb_data)
+
+                # 2. Coin Action Card
+                mock_target = AsyncMock()
+                await _show_coin_card(mock_target, "SOL", mock_engine)
+                self.assertTrue(mock_target.reply_text.called)
+                card_text = mock_target.reply_text.call_args[0][0]
+                card_markup = mock_target.reply_text.call_args[1]["reply_markup"]
+                self.assertIn("SOL / USDT", card_text)
+                card_cbs = [btn.callback_data for row in card_markup.inline_keyboard for btn in row if btn.callback_data]
+                self.assertIn("chart_SOLUSDT_1h_tv", card_cbs)
+                self.assertIn("wiz_coin_SOL", card_cbs)
+                self.assertIn("wiz_type_SOL_siren", card_cbs)
+                self.assertIn("wiz_grid_SOL", card_cbs)
+                self.assertIn("watch_toggle_SOL", card_cbs)
+                self.assertIn("hub_main", card_cbs)
+
+                # 3. Alert Editor Deck
+                res = await _render_alert_editor(aid)
+                self.assertIsNotNone(res)
+                ed_text, ed_markup = res
+                self.assertIn(f"Manage Alert #{aid}", ed_text)
+                self.assertIn("SOL", ed_text)
+                ed_cbs = [btn.callback_data for row in ed_markup.inline_keyboard for btn in row if btn.callback_data]
+                self.assertIn(f"edittgt_{aid}_1", ed_cbs)
+                self.assertIn(f"edittgt_{aid}_5", ed_cbs)
+                self.assertIn(f"edittgt_{aid}_-1", ed_cbs)
+                self.assertIn(f"edittgt_{aid}_-5", ed_cbs)
+                self.assertIn(f"edit_flip_{aid}", ed_cbs)
+                self.assertIn(f"edit_custom_{aid}", ed_cbs)
+                self.assertIn(f"toggle_urgent_{aid}", ed_cbs)
+                self.assertIn(f"toggle_repeat_{aid}", ed_cbs)
+                self.assertIn(f"snooze_{aid}_1h", ed_cbs)
+                self.assertIn(f"remove_{aid}", ed_cbs)
+                self.assertIn("hub_alerts", ed_cbs)
+
+                # 4. Watchlist Deck
+                w_text, w_markup = await _render_watch_deck(mock_engine)
+                self.assertIn("Watchlist Deck", w_text)
+
+                # 5. Pause Deck
+                p_text, p_markup = await _render_pause_deck(mock_engine)
+                self.assertIn("Pause / Resume", p_text)
+
+                # 6. Tools Deck
+                t_text, t_markup = await _render_tools_deck(mock_engine, None)
+                self.assertIn("Tools & Diagnostics", t_text)
+
+                # 7. Wizard Start & Coin
+                wiz_text, wiz_markup = await _render_wiz_start()
+                self.assertIn("Step 1: Select a Coin", wiz_text)
+
+                coin_text, coin_markup = await _render_wiz_coin("BTC", mock_engine)
+                self.assertIn("Set Alert for BTC", coin_text)
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()
 
