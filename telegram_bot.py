@@ -182,6 +182,16 @@ def _escape_md(text: str) -> str:
     return text
 
 
+async def _safe_reply_md(target_msg, text: str, reply_markup=None):
+    """Safely reply with Markdown, falling back to plain text if Markdown parsing fails."""
+    try:
+        return await target_msg.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"Markdown reply failed ({e}); falling back to plain text")
+        plain = text.replace("*", "").replace("`", "")
+        return await target_msg.reply_text(plain, reply_markup=reply_markup)
+
+
 async def _resolve_symbol(coin_or_symbol: str, engine=None) -> tuple | None:
     """Normalize + verify a symbol. Returns (symbol, price)."""
     symbol = normalize_symbol(coin_or_symbol)
@@ -1517,17 +1527,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             urgent_badge = " [🚨 URGENT]" if is_urgent else ""
             if len(added) == 1:
                 aid, target, condition = added[0]
-                prefix = "🚨 *Emergency Siren Alert" if is_urgent else "✅ Alert"
+                prefix = "🚨 *Emergency Siren Alert*" if is_urgent else "✅ Alert"
                 if price is not None:
-                    await update.message.reply_text(
+                    await _safe_reply_md(
+                        update.message,
                         f"{prefix} #{aid} added: *{coin}* {condition} *{format_price(target)}* "
                         f"(now {format_price(price)}){urgent_badge}.",
-                        parse_mode="Markdown",
                     )
                 else:
-                    await update.message.reply_text(
+                    await _safe_reply_md(
+                        update.message,
                         f"{prefix} #{aid} added: *{coin}* {condition} *{format_price(target)}*{urgent_badge}.",
-                        parse_mode="Markdown",
                     )
             else:
                 now_str = f" (now {format_price(price)})" if price is not None else ""
@@ -1539,7 +1549,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 lines = [header]
                 for aid, target, condition in added:
                     lines.append(f"  • #{aid} {condition} *{format_price(target)}*{urgent_badge}")
-                await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+                await _safe_reply_md(update.message, "\n".join(lines))
             return
 
     # Normal Main Menu
