@@ -1600,9 +1600,10 @@ def _build_chart_ui(symbol: str, interval: str, chart_type: str) -> tuple[str, I
         InlineKeyboardButton("🌐 TV.com", url=tv_web_url),
     ]
 
+    has_tv_key = bool(getattr(config, "CHART_IMG_API_KEY", ""))
     style_labels = {
-        "tv": "📸 TradingView Pro",
-        "chartimg": "📸 TradingView Pro",
+        "tv": "📸 TradingView Pro" if has_tv_key else "📊 Tech TA (No TV API Key)",
+        "chartimg": "📸 TradingView Pro" if has_tv_key else "📊 Tech TA (No TV API Key)",
         "ta": "📊 Technical Analysis (EMA+RSI)",
         "tech": "📊 Technical Analysis (EMA+RSI)",
         "mpl": "📊 Technical Analysis (EMA+RSI)",
@@ -2804,11 +2805,10 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
             if interval not in valid_intervals:
                 interval = "1h"
-            valid_types = ("tv", "ta", "candle", "line", "tech", "mpl", "chartimg")
-            if chart_type not in valid_types:
-                chart_type = "tv"
-
-            await answer("Updating chart...")
+            if chart_type in ("tv", "chartimg") and not getattr(config, "CHART_IMG_API_KEY", ""):
+                await answer("⚠️ CHART_IMG_API_KEY not set in .env — showing Tech TA.", show_alert=True)
+            else:
+                await answer("Updating chart...")
             chart_png = await charts.generate_chart_image(sym, interval=interval, chart_type=chart_type)
             if chart_png:
                 caption, markup = _build_chart_ui(sym, interval, chart_type)
