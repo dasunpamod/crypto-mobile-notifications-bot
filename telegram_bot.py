@@ -195,6 +195,50 @@ async def _safe_reply_md(target_msg, text: str, reply_markup=None):
         return await target_msg.reply_text(plain, reply_markup=reply_markup)
 
 
+async def _safe_edit_md(query, text: str, reply_markup=None):
+    """Safely edit message text with Markdown, falling back to plain text if Markdown parsing fails."""
+    try:
+        if reply_markup is not None:
+            return await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        return await query.edit_message_text(text, parse_mode="Markdown")
+    except Exception as e:
+        err = str(e).lower()
+        if "message is not modified" in err:
+            return None
+        logger.warning(f"Markdown edit failed ({e}); falling back to plain text")
+        plain = text.replace("*", "").replace("`", "").replace("_", "")
+        try:
+            if reply_markup is not None:
+                return await query.edit_message_text(plain, reply_markup=reply_markup)
+            return await query.edit_message_text(plain)
+        except Exception as e2:
+            if "message is not modified" not in str(e2).lower():
+                logger.error(f"Fallback plain text edit failed: {e2}")
+            return None
+
+
+def get_fast_price(symbol: str, engine=None) -> float | None:
+    """Instant price lookup (<0.001ms) from live WebSocket engine or local cache. Never blocks."""
+    norm = normalize_symbol(symbol)
+    if engine and hasattr(engine, "get_fresh_price"):
+        p = engine.get_fresh_price(norm, max_age_sec=60)
+        if p is not None:
+            return p
+    return cached_price(norm, max_age_sec=120)
+
+
+async def get_fast_or_live_price(symbol: str, engine=None, timeout: float = 1.5) -> float | None:
+    """Instant price lookup first, with strict-timeout REST fallback if missing."""
+    p = get_fast_price(symbol, engine)
+    if p is not None:
+        return p
+    try:
+        norm = normalize_symbol(symbol)
+        return await asyncio.wait_for(get_current_price(norm), timeout=timeout)
+    except Exception:
+        return None
+
+
 def _get_target_msg(update: Update):
     if update.message:
         return update.message
@@ -268,7 +312,6 @@ async def _render_dashboard(engine) -> tuple[str, InlineKeyboardMarkup]:
     watch = await _effective_watchlist()
     alert_count = await db.count_alerts()
     symbols = list(watch[:4])
-    tickers = await get_tickers(symbols)
 
     status_str = "⏸️ *ALERTS PAUSED*" if (engine and engine.is_muted()) else "🟢 *ONLINE (Active)*"
     stamp = config.now_local().strftime("%H:%M:%S")
@@ -283,13 +326,9 @@ async def _render_dashboard(engine) -> tuple[str, InlineKeyboardMarkup]:
 
     for sym in symbols:
         coin = _escape_md(sym.replace("USDT", ""))
-        ticker = tickers.get(sym)
-        price = ticker_price(ticker)
-        if price is None and engine:
-            price = engine.get_fresh_price(sym, max_age_sec=30)
-        if price is None:
-            price = cached_price(sym, max_age_sec=120)
-        pct = ticker_change_24h(ticker or cached_ticker(sym))
+        price = get_fast_price(sym, engine)
+        ticker = cached_ticker(sym)
+        pct = ticker_change_24h(ticker)
         pct_str = f" ({_fmt_pct(pct)})" if pct is not None else ""
         lines.append(f"  • *{coin}*: {format_price(price) if price else 'loading...'}{pct_str}")
 
@@ -328,14 +367,16 @@ async def _show_coin_card(target, symbol: str, engine=None) -> None:
     symbol = normalize_symbol(symbol)
     coin = symbol.replace("USDT", "")
     coin_safe = _escape_md(coin)
-    ticker = await get_ticker(symbol)
-    price = ticker_price(ticker)
-    if price is None and engine:
-        price = engine.get_fresh_price(symbol, max_age_sec=30)
+    price = get_fast_price(symbol, engine)
+    ticker = cached_ticker(symbol)
     if price is None:
-        price = cached_price(symbol, max_age_sec=120)
+        try:
+            price = await asyncio.wait_for(get_current_price(symbol), timeout=1.5)
+            ticker = cached_ticker(symbol)
+        except Exception:
+            pass
 
-    pct = ticker_change_24h(ticker or cached_ticker(symbol))
+    pct = ticker_change_24h(ticker)
     pct_str = f" ({_fmt_pct(pct)} 24h)" if pct is not None else ""
 
     watched = await db.is_watched(symbol)
@@ -381,9 +422,9 @@ async def _show_coin_card(target, symbol: str, engine=None) -> None:
     ]
     markup = InlineKeyboardMarkup(kb)
     if hasattr(target, "reply_text"):
-        await target.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+        await _safe_reply_md(target, "\n".join(lines), reply_markup=markup)
     else:
-        await target.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+        await _safe_edit_md(target, "\n".join(lines), reply_markup=markup)
 
 
 async def _render_movers_deck() -> tuple[str, InlineKeyboardMarkup]:
@@ -417,19 +458,14 @@ async def _render_movers_deck() -> tuple[str, InlineKeyboardMarkup]:
 async def _render_watch_deck(engine=None) -> tuple[str, InlineKeyboardMarkup]:
     """Generate the interactive Watchlist deck."""
     watch = await _effective_watchlist()
-    tickers = await get_tickers(watch)
     lines = ["👁️ *Watchlist Deck*\n_Tap any coin to view charts, set alerts, or manage:_\n"]
     kb = []
     current_row = []
     for sym in watch:
         coin = sym.replace("USDT", "")
-        ticker = tickers.get(sym)
-        p = ticker_price(ticker)
-        if p is None and engine:
-            p = engine.get_fresh_price(sym, max_age_sec=30)
-        if p is None:
-            p = cached_price(sym, max_age_sec=120)
-        pct = ticker_change_24h(ticker or cached_ticker(sym))
+        p = get_fast_price(sym, engine)
+        ticker = cached_ticker(sym)
+        pct = ticker_change_24h(ticker)
         pct_str = f" ({_fmt_pct(pct)})" if pct is not None else ""
         lines.append(f"  • *{_escape_md(coin)}*: {format_price(p) if p else 'N/A'}{pct_str}")
         current_row.append(InlineKeyboardButton(f"🪙 {coin}", callback_data=f"coin_card_{coin}"))
@@ -552,11 +588,12 @@ async def _render_wiz_coin(coin: str, engine=None) -> tuple[str, InlineKeyboardM
     """Generate Alert Wizard: Step 2 Alert Type / 1-Tap Percentages."""
     symbol = normalize_symbol(coin)
     coin_safe = _escape_md(coin.upper())
-    price = await get_current_price(symbol)
-    if price is None and engine:
-        price = engine.get_fresh_price(symbol, max_age_sec=30)
+    price = get_fast_price(symbol, engine)
     if price is None:
-        price = cached_price(symbol, max_age_sec=120)
+        try:
+            price = await asyncio.wait_for(get_current_price(symbol), timeout=1.5)
+        except Exception:
+            price = None
 
     lines = [
         f"🎯 *Set Alert for {coin_safe}*",
@@ -620,11 +657,12 @@ async def _render_wiz_move(coin: str, engine=None) -> tuple[str, InlineKeyboardM
 async def _render_wiz_grid(coin: str, engine=None) -> tuple[str, InlineKeyboardMarkup]:
     """Generate Grid Range wizard presets."""
     symbol = normalize_symbol(coin)
-    price = await get_current_price(symbol)
-    if price is None and engine:
-        price = engine.get_fresh_price(symbol, max_age_sec=30)
+    price = get_fast_price(symbol, engine)
     if price is None:
-        price = cached_price(symbol, max_age_sec=120)
+        try:
+            price = await asyncio.wait_for(get_current_price(symbol), timeout=1.5)
+        except Exception:
+            price = None
 
     lines = [
         f"📐 *Price Grid Setup for {coin.upper()}*",
@@ -782,7 +820,7 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
             flags.append(f"snoozed till {_fmt_ts(snoozed)}")
         if expires:
             flags.append(f"expires {_fmt_ts(expires)}")
-        flag_txt = f" [{', '.join(flags)}]" if flags else " [once]"
+        flag_txt = f" ({', '.join(flags)})" if flags else " (once)"
         lines.append(f"  #{alert_id}{flag_txt} *{coin}* {desc}")
         keyboard.append([
             InlineKeyboardButton(f"⚙️ Edit #{alert_id}", callback_data=f"edit_{alert_id}"),
@@ -791,19 +829,11 @@ async def get_list_text_and_markup(engine, page: int = 0, filt: str | None = Non
 
     lines.append("")
     symbols = sorted({a[1] for a in chunk})
-    tickers = await get_tickers(symbols)
     for symbol in symbols:
-        ticker = tickers.get(symbol)
-        price = ticker_price(ticker)
-        if price is None and engine:
-            price = engine.get_fresh_price(symbol, max_age_sec=30)
-        if price is None:
-            price = cached_price(symbol, max_age_sec=120)
-        if price is None:
-            price = await get_current_price(symbol)
+        price = get_fast_price(symbol, engine)
         if price is not None:
             coin = _escape_md(symbol.replace("USDT", ""))
-            pct = ticker_change_24h(tickers.get(symbol) or cached_ticker(symbol))
+            pct = ticker_change_24h(cached_ticker(symbol))
             extra = f" ({_fmt_pct(pct)})" if pct is not None else ""
             lines.append(f"  {coin}: {format_price(price)}{extra}")
 
@@ -2325,12 +2355,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if _query_answered:
             return
         _query_answered = True
-        return await _orig_answer(*args, **kwargs)
+        try:
+            return await _orig_answer(*args, **kwargs)
+        except Exception:
+            pass
 
     query.answer = _wrapped_answer
 
     try:
         await _dispatch_callback(query, update, context)
+    except Exception as e:
+        logger.error(f"Callback dispatch error for data={query.data!r}: {e}", exc_info=True)
+        try:
+            await _safe_edit_md(
+                query,
+                f"⚠️ *An error occurred:* `{_escape_md(str(e)[:150])}`\n\nTap below to return:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Return to Dashboard", callback_data="hub_main")]])
+            )
+        except Exception:
+            pass
     finally:
         if not _query_answered:
             try:
@@ -2345,103 +2388,87 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
     engine = context.bot_data["engine"]
 
     if data == "hub_main":
+        await query.answer()
         txt, kb = await _render_dashboard(engine)
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_refresh":
         await query.answer("⚡ Dashboard updated!")
         txt, kb = await _render_dashboard(engine)
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_alerts":
+        await query.answer()
         txt, kb = await get_list_text_and_markup(engine)
-        try:
-            if kb:
-                await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-            else:
-                await query.edit_message_text(txt, parse_mode="Markdown")
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_movers":
+        await query.answer()
         txt, kb = await _render_movers_deck()
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_watch":
+        await query.answer()
         txt, kb = await _render_watch_deck(engine)
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_pause":
+        await query.answer()
         txt, kb = await _render_pause_deck(engine)
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_tools":
+        await query.answer()
         ws = context.bot_data.get("ws")
         txt, kb = await _render_tools_deck(engine, ws)
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_charts":
+        await query.answer()
         txt, kb = await _render_charts_hub()
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_grid":
+        await query.answer()
         txt, kb = await _render_wiz_start()
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_history":
+        await query.answer()
         await cmd_history(update, context)
         return
 
     if data == "hub_health":
+        await query.answer()
         await cmd_health(update, context)
         return
 
     if data == "hub_backup":
+        await query.answer()
         await cmd_backup(update, context)
         return
 
     if data == "hub_export":
+        await query.answer()
         await cmd_export(update, context)
         return
 
     if data == "hub_update":
+        await query.answer()
         await cmd_update(update, context)
         return
 
     if data.startswith("coin_card_"):
+        await query.answer()
         coin = data[len("coin_card_"):]
         await _show_coin_card(query, coin, engine)
         return
@@ -2458,6 +2485,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         return
 
     if data == "watch_add_wiz":
+        await query.answer()
         context.user_data["awaiting_watch_coin"] = True
         kb = [
             [InlineKeyboardButton("+DOGE", callback_data="watch_add_quick_DOGE"), InlineKeyboardButton("+XRP", callback_data="watch_add_quick_XRP")],
@@ -2465,9 +2493,9 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             [InlineKeyboardButton("+AVAX", callback_data="watch_add_quick_AVAX"), InlineKeyboardButton("+LINK", callback_data="watch_add_quick_LINK")],
             [InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")],
         ]
-        await query.edit_message_text(
+        await _safe_edit_md(
+            query,
             "➕ *Add to Watchlist*\n\nTap a popular coin below or type any ticker in chat (e.g. `NEAR`):",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -2481,16 +2509,17 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             await ws.subscribe(sym)
         await query.answer(f"Added {coin} to watchlist!")
         txt, kb = await _render_watch_deck(engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "watch_del_wiz":
+        await query.answer()
         watch = await _effective_watchlist()
         kb = [[InlineKeyboardButton(f"❌ Remove {s.replace('USDT', '')}", callback_data=f"watch_remove_{s.replace('USDT', '')}")] for s in watch]
         kb.append([InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")])
-        await query.edit_message_text(
+        await _safe_edit_md(
+            query,
             "🗑️ *Select a coin to remove from watchlist:*",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -2501,7 +2530,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         await db.remove_watch(sym)
         await query.answer(f"Removed {coin} from watchlist.")
         txt, kb = await _render_watch_deck(engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("pause_dur_"):
@@ -2510,43 +2539,48 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         engine.pause_alerts(secs / 3600)
         await query.answer(f"Alerts paused for {dur}!")
         txt, kb = await _render_pause_deck(engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "pause_resume":
         engine.resume_alerts()
         await query.answer("Alerts resumed! 🔔")
         txt, kb = await _render_dashboard(engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "wiz_start":
+        await query.answer()
         txt, kb = await _render_wiz_start()
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_coin_"):
+        await query.answer()
         coin = data[len("wiz_coin_"):]
         txt, kb = await _render_wiz_coin(coin, engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_trail_"):
+        await query.answer()
         coin = data[len("wiz_trail_"):]
         txt, kb = await _render_wiz_trail(coin, engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_move_"):
+        await query.answer()
         coin = data[len("wiz_move_"):]
         txt, kb = await _render_wiz_move(coin, engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_grid_"):
+        await query.answer()
         coin = data[len("wiz_grid_"):]
         txt, kb = await _render_wiz_grid(coin, engine)
-        await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_add_pct_"):
@@ -2557,9 +2591,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         coin = parts[3].upper()
         pct = float(parts[4])
         sym = normalize_symbol(coin)
-        price = await get_current_price(sym)
-        if price is None and engine:
-            price = engine.get_fresh_price(sym, max_age_sec=30)
+        price = await get_fast_or_live_price(sym, engine)
         if not price:
             await query.answer("Could not get current price.", show_alert=True)
             return
@@ -2575,12 +2607,12 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
              InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts")],
             [InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
         ]
-        await query.edit_message_text(
+        await _safe_edit_md(
+            query,
             f"✅ *Alert #{aid} created for {_escape_md(coin)}!*\n\n"
             f"• Target: *{cond.upper()} {format_price(tgt)}* ({pct:+.0f}%)\n"
             f"• Mode: Repeat\n"
             f"• Current Price: {format_price(price)}",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -2593,9 +2625,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         coin = parts[3].upper()
         pct = float(parts[4])
         sym = normalize_symbol(coin)
-        price = await get_current_price(sym)
-        if price is None and engine:
-            price = engine.get_fresh_price(sym, max_age_sec=30)
+        price = await get_fast_or_live_price(sym, engine)
         if not price:
             await query.answer("Could not get current price.", show_alert=True)
             return
@@ -2608,11 +2638,11 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
              InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
         ]
-        await query.edit_message_text(
+        await _safe_edit_md(
+            query,
             f"✅ *Trailing Stop #{aid} created for {_escape_md(coin)}!*\n\n"
             f"• Pullback: *{pct}% from peak*\n"
             f"• Current Price: {format_price(price)}",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -2626,9 +2656,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         pct = float(parts[4])
         win = int(parts[5])
         sym = normalize_symbol(coin)
-        price = await get_current_price(sym)
-        if price is None and engine:
-            price = engine.get_fresh_price(sym, max_age_sec=30)
+        price = await get_fast_or_live_price(sym, engine)
         if not price:
             await query.answer("Could not get current price.", show_alert=True)
             return
@@ -2641,11 +2669,11 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
              InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
         ]
-        await query.edit_message_text(
+        await _safe_edit_md(
+            query,
             f"✅ *Move Alert #{aid} created for {_escape_md(coin)}!*\n\n"
             f"• Trigger: *{pct}% move within {win}m*\n"
             f"• Current Price: {format_price(price)}",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -2659,9 +2687,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             await query.answer(f"Not enough room (limit {_max_alerts()}).", show_alert=True)
             return
         sym = normalize_symbol(coin)
-        price = await get_current_price(sym)
-        if price is None and engine:
-            price = engine.get_fresh_price(sym, max_age_sec=30)
+        price = await get_fast_or_live_price(sym, engine)
         if not price:
             await query.answer("Could not get current price.", show_alert=True)
             return
@@ -2684,12 +2710,12 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
              InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
         ]
-        await query.edit_message_text(
+        await _safe_edit_md(
+            query,
             f"🌐 *Grid deployed for {_escape_md(coin)}!*\n\n"
             f"• Deployed {len(added_ids)} alerts between *{format_price(low)}* and *{format_price(high)}*\n"
             f"• Spread: ±{spread:g}%\n"
             f"• Current Price: {format_price(price)}",
-            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -2809,7 +2835,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         return
 
     if data.startswith("list_"):
-        # list_<page>|<filt>
+        await query.answer()
         try:
             rest = data[len("list_"):]
             page_s, _, filt = rest.partition("|")
@@ -2817,16 +2843,11 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         except ValueError:
             page, filt = 0, None
         text, markup = await get_list_text_and_markup(engine, page=page, filt=filt or None)
-        try:
-            if markup:
-                await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-            else:
-                await query.edit_message_text(text, parse_mode="Markdown")
-        except Exception:
-            pass
+        await _safe_edit_md(query, text, reply_markup=markup)
         return
 
     if data.startswith("refresh_list"):
+        await query.answer("List refreshed!")
         rest = data[len("refresh_list"):].lstrip("_")
         page_s, _, filt = rest.partition("|")
         try:
@@ -2835,13 +2856,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             page = 0
         text, markup = await get_list_text_and_markup(engine, page=page, filt=filt or None)
         stamp = f"\n_Refreshed: {datetime.datetime.now().strftime('%H:%M:%S')}_"
-        try:
-            if markup:
-                await query.edit_message_text(text + stamp, parse_mode="Markdown", reply_markup=markup)
-            else:
-                await query.edit_message_text(text + stamp, parse_mode="Markdown")
-        except Exception:
-            pass
+        await _safe_edit_md(query, text + stamp, reply_markup=markup)
         return
 
     if data.startswith("edit_custom_"):
@@ -2856,10 +2871,10 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 await query.answer("Custom price is only supported for price alerts.", show_alert=True)
                 return
             context.user_data["editing_alert_target"] = alert_id
-            await query.edit_message_text(
+            await _safe_edit_md(
+                query,
                 f"✏️ *Editing Target Price for Alert #{alert_id}*\n\n"
                 f"Please reply with the new target price in chat (e.g. `74500` or `152.5`):",
-                parse_mode="Markdown",
             )
         except Exception as e:
             await query.answer(f"Error: {e}")
@@ -2884,7 +2899,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                     await query.answer(f"Target set to {format_price(new_tgt)} ({delta:+.0f}%)")
                     res = await _render_alert_editor(aid)
                     if res:
-                        await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+                        await _safe_edit_md(query, res[0], reply_markup=res[1])
             except Exception as e:
                 await query.answer(f"Error: {e}")
         return
@@ -2905,7 +2920,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 await query.answer(f"Condition flipped to {new_cond.upper()}!")
                 res = await _render_alert_editor(aid)
                 if res:
-                    await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+                    await _safe_edit_md(query, res[0], reply_markup=res[1])
         except Exception as e:
             await query.answer(f"Error: {e}")
         return
@@ -2917,7 +2932,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             await query.answer(f"Repeat {'ENABLED' if new_val else 'DISABLED'}")
             res = await _render_alert_editor(aid)
             if res:
-                await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+                await _safe_edit_md(query, res[0], reply_markup=res[1])
         except Exception as e:
             await query.answer(f"Error: {e}")
         return
@@ -2933,7 +2948,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             await query.answer(status_str)
             res = await _render_alert_editor(alert_id)
             if res:
-                await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+                await _safe_edit_md(query, res[0], reply_markup=res[1])
         except Exception as e:
             await query.answer(f"Error: {e}")
         return
@@ -2949,7 +2964,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 await query.answer(f"🔕 Snoozed for {hours}h!")
                 res = await _render_alert_editor(alert_id)
                 if res:
-                    await query.edit_message_text(res[0], parse_mode="Markdown", reply_markup=res[1])
+                    await _safe_edit_md(query, res[0], reply_markup=res[1])
                 return
             except ValueError:
                 pass
@@ -2959,18 +2974,13 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             alert_id = int(data.split("_")[1])
         except (ValueError, IndexError):
             return
+        await query.answer()
         res = await _render_alert_editor(alert_id)
         if not res:
-            try:
-                await query.edit_message_text(f"Alert #{alert_id} not found.", reply_markup=None)
-            except Exception:
-                pass
+            await _safe_edit_md(query, f"Alert #{alert_id} not found.", reply_markup=None)
             return
         txt, kb = res
-        try:
-            await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+        await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "removeall_confirm":
@@ -2981,10 +2991,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             for symbol in symbols:
                 if not await _should_keep_subscribed(symbol):
                     await ws.unsubscribe(symbol)
-            try:
-                await query.edit_message_text(f"Removed all {count} alert(s).", reply_markup=None)
-            except Exception:
-                pass
+            await _safe_edit_md(query, f"Removed all {count} alert(s).", reply_markup=None)
         except Exception as e:
             logger.error(f"Error handling removeall: {e}")
         return
@@ -3004,18 +3011,9 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                     await ws.unsubscribe(symbol)
                 text, markup = await get_list_text_and_markup(engine)
                 prefix = f"Alert #{alert_id} removed.\n\n"
-                try:
-                    if markup:
-                        await query.edit_message_text(prefix + text, parse_mode="Markdown", reply_markup=markup)
-                    else:
-                        await query.edit_message_text(prefix + text, parse_mode="Markdown")
-                except Exception:
-                    pass
+                await _safe_edit_md(query, prefix + text, reply_markup=markup)
             else:
-                try:
-                    await query.edit_message_text(f"Alert #{alert_id} already removed.", reply_markup=None)
-                except Exception:
-                    pass
+                await _safe_edit_md(query, f"Alert #{alert_id} already removed.", reply_markup=None)
         except Exception as e:
             logger.error(f"Error handling remove: {e}")
         return

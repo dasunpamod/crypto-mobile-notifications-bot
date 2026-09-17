@@ -1383,7 +1383,97 @@ class TestAuditRemediations(unittest.TestCase):
                 os.unlink(tmp.name)
         _run(go())
 
+    def test_navigation_callbacks_immediate_answer_and_safe_edit(self):
+        async def go():
+            import database as db
+            import telegram_bot
+            from unittest.mock import AsyncMock, MagicMock, patch
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                await db.add_alert("BTCUSDT", 70000, "above")
+
+                mock_engine = MagicMock()
+                mock_engine.is_muted.return_value = False
+                mock_engine.get_fresh_price.return_value = 76310.0
+                mock_engine.get_stats.return_value = {}
+
+                mock_context = MagicMock()
+                mock_context.bot_data = {"engine": mock_engine, "ws": MagicMock(connected=True)}
+                mock_context.user_data = {}
+
+                callbacks = [
+                    "hub_main",
+                    "hub_alerts",
+                    "hub_movers",
+                    "hub_watch",
+                    "hub_pause",
+                    "hub_tools",
+                    "hub_charts",
+                    "hub_grid",
+                    "wiz_start",
+                    "wiz_coin_BTC",
+                    "wiz_trail_BTC",
+                    "wiz_move_BTC",
+                    "wiz_grid_BTC",
+                ]
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    for cb in callbacks:
+                        mock_query = AsyncMock()
+                        mock_query.data = cb
+                        mock_update = MagicMock()
+                        mock_update.callback_query = mock_query
+                        mock_update.message = None
+                        mock_update.effective_user.id = 123
+
+                        await telegram_bot.handle_callback(mock_update, mock_context)
+                        self.assertTrue(mock_query.answer.called, f"Callback {cb} did not answer query immediately!")
+                        self.assertTrue(mock_query.edit_message_text.called, f"Callback {cb} did not edit message!")
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_safe_edit_md_fallback(self):
+        async def go():
+            from telegram_bot import _safe_edit_md
+            from unittest.mock import AsyncMock
+
+            # Test fallback when Markdown entity parsing fails
+            query = AsyncMock()
+            query.edit_message_text.side_effect = [Exception("Can't parse entities in Markdown"), None]
+
+            res = await _safe_edit_md(query, "*Unclosed bold")
+            self.assertEqual(query.edit_message_text.call_count, 2)
+            second_call_args = query.edit_message_text.call_args_list[1]
+            self.assertNotIn("parse_mode", second_call_args.kwargs)
+
+            # Test graceful handling of message not modified
+            query_unmod = AsyncMock()
+            query_unmod.edit_message_text.side_effect = Exception("Bad Request: message is not modified")
+            res2 = await _safe_edit_md(query_unmod, "Same text")
+            self.assertIsNone(res2)
+        _run(go())
+
+    def test_get_fast_price_instant_resolution(self):
+        from telegram_bot import get_fast_price
+        from unittest.mock import MagicMock
+
+        engine = MagicMock()
+        engine.get_fresh_price.return_value = 99.45
+
+        # Instant lookup from engine
+        p = get_fast_price("SOL", engine)
+        self.assertEqual(p, 99.45)
+        engine.get_fresh_price.assert_called_with("SOLUSDT", max_age_sec=60)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
