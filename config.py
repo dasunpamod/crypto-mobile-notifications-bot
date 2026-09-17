@@ -195,6 +195,12 @@ ALERT_PRIORITY_REPEAT: str = os.getenv("ALERT_PRIORITY_REPEAT", "default").strip
 if ALERT_PRIORITY_REPEAT not in _VALID_PRIORITIES:
     ALERT_PRIORITY_REPEAT = "default"
 
+# Chart rendering configuration
+CHART_IMG_API_KEY: str = os.getenv("CHART_IMG_API_KEY", "qzdY6KOJir6sK1y1z5Z6v2ZugCOONRDM2LC6OeOa").strip().strip("'\"")
+DEFAULT_CHART_ENGINE: str = os.getenv("DEFAULT_CHART_ENGINE", "chartimg").strip().lower()
+
+
+
 
 def validate_config() -> list:
     """Return a list of human-readable configuration problems (empty = ok)."""

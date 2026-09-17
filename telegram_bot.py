@@ -5,7 +5,10 @@ import logging
 import datetime
 import time
 
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from telegram import (
+    Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
+    InlineKeyboardButton, BotCommand, WebAppInfo, InputMediaPhoto
+)
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 
 import database as db
@@ -982,15 +985,60 @@ async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+def _build_chart_ui(symbol: str, interval: str, chart_type: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Build standardized 3-row interactive keyboard and caption for charts."""
+    coin = symbol.replace("USDT", "")
+    tv_embed_url = charts.get_tradingview_embed_url(symbol, interval=interval)
+    tv_web_url = charts.get_tradingview_web_url(symbol)
+
+    valid_intervals = ("15m", "1h", "4h", "1d")
+    row1 = [
+        InlineKeyboardButton(
+            f"• {intv} •" if intv == interval else intv,
+            callback_data=f"chart_{symbol}_{intv}_{chart_type}",
+        )
+        for intv in valid_intervals
+    ]
+
+    row2 = [
+        InlineKeyboardButton(f"{'• 📸 TV •' if chart_type in ('tv', 'chartimg') else '📸 TV Snap'}", callback_data=f"chart_{symbol}_{interval}_tv"),
+        InlineKeyboardButton(f"{'• 📊 TA •' if chart_type in ('ta', 'tech', 'mpl') else '📊 Tech TA'}", callback_data=f"chart_{symbol}_{interval}_ta"),
+        InlineKeyboardButton(f"{'• 🕯️ •' if chart_type == 'candle' else '🕯️ Clean'}", callback_data=f"chart_{symbol}_{interval}_candle"),
+        InlineKeyboardButton(f"{'• 📈 •' if chart_type == 'line' else '📈 Line'}", callback_data=f"chart_{symbol}_{interval}_line"),
+    ]
+
+    row3 = [
+        InlineKeyboardButton("🚀 Open Live TV Chart", web_app=WebAppInfo(url=tv_embed_url)),
+        InlineKeyboardButton("🌐 TV.com", url=tv_web_url),
+    ]
+
+    style_labels = {
+        "tv": "📸 TradingView Pro",
+        "chartimg": "📸 TradingView Pro",
+        "ta": "📊 Technical Analysis (EMA+RSI)",
+        "tech": "📊 Technical Analysis (EMA+RSI)",
+        "mpl": "📊 Technical Analysis (EMA+RSI)",
+        "candle": "🕯️ Clean Candlesticks",
+        "line": "📈 Sleek Area Line",
+    }
+    style_label = style_labels.get(chart_type, "📸 TradingView Pro")
+    caption = f"📊 *{_escape_md(coin)}* ({interval.upper()}) • {style_label}"
+    return caption, InlineKeyboardMarkup([row1, row2, row3])
+
+
 @authorized
 async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/chart <symbol> [interval] — generate a dark-mode price chart."""
+    """/chart <symbol> [interval] [style] — generate a dark-mode price chart."""
     args = context.args or []
     if not args:
         await update.message.reply_text(
-            "Usage: `/chart <symbol> [interval]`\n\n"
+            "Usage: `/chart <symbol> [interval] [style]`\n\n"
             "Supported intervals: `15m`, `30m`, `1h` (default), `2h`, `4h`, `1d`, `1w`\n"
-            "Example: `/chart BTC 4h`",
+            "Supported styles: `tv` (TradingView snapshot), `ta` (EMA + RSI), `candle`, `line`\n\n"
+            "Examples:\n"
+            "• `/chart BTC 4h`\n"
+            "• `/chart ETH 1h ta`\n"
+            "• `/chart SOL line`",
             parse_mode="Markdown"
         )
         return
@@ -1002,10 +1050,14 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     interval = "1h"
-    chart_type = "candle"
+    chart_type = getattr(config, "DEFAULT_CHART_ENGINE", "tv")
     valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
-    valid_types = {"candle": "candle", "candles": "candle", "candlestick": "candle",
-                   "line": "line", "area": "line"}
+    valid_types = {
+        "tv": "tv", "snap": "tv", "tradingview": "tv", "chartimg": "tv",
+        "ta": "ta", "tech": "ta", "mpl": "ta", "technical": "ta",
+        "candle": "candle", "candles": "candle", "candlestick": "candle", "clean": "candle",
+        "line": "line", "area": "line"
+    }
     for arg in [a.lower() for a in args[1:]]:
         if arg in valid_intervals:
             interval = arg
@@ -1025,26 +1077,14 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    coin = symbol.replace("USDT", "")
-    kb = [
-        [
-            InlineKeyboardButton("15m", callback_data=f"chart_{symbol}_15m_{chart_type}"),
-            InlineKeyboardButton("1h", callback_data=f"chart_{symbol}_1h_{chart_type}"),
-            InlineKeyboardButton("4h", callback_data=f"chart_{symbol}_4h_{chart_type}"),
-            InlineKeyboardButton("1d", callback_data=f"chart_{symbol}_1d_{chart_type}"),
-        ],
-        [
-            InlineKeyboardButton("🕯️ Candles", callback_data=f"chart_{symbol}_{interval}_candle"),
-            InlineKeyboardButton("📈 Line / Area", callback_data=f"chart_{symbol}_{interval}_line"),
-        ]
-    ]
-    caption = f"📊 *{_escape_md(coin)}* ({interval.upper()}) • {'🕯️ Candles' if chart_type == 'candle' else '📈 Line'}"
+    caption, markup = _build_chart_ui(symbol, interval, chart_type)
     await update.message.reply_photo(
         photo=chart_png,
         caption=caption,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=markup,
     )
+
 
 
 @authorized
@@ -1680,38 +1720,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if len(parts) >= 2:
             sym = normalize_symbol(parts[1])
             interval = parts[2].lower() if len(parts) >= 3 else "1h"
-            chart_type = parts[3].lower() if len(parts) >= 4 else "candle"
+            chart_type = parts[3].lower() if len(parts) >= 4 else getattr(config, "DEFAULT_CHART_ENGINE", "tv")
             valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
             if interval not in valid_intervals:
                 interval = "1h"
-            if chart_type not in ("candle", "line"):
-                chart_type = "candle"
+            valid_types = ("tv", "ta", "candle", "line", "tech", "mpl", "chartimg")
+            if chart_type not in valid_types:
+                chart_type = "tv"
 
             await query.answer("Updating chart...")
             chart_png = await charts.generate_chart_image(sym, interval=interval, chart_type=chart_type)
             if chart_png:
-                coin = sym.replace("USDT", "")
-                kb = [
-                    [
-                        InlineKeyboardButton("15m", callback_data=f"chart_{sym}_15m_{chart_type}"),
-                        InlineKeyboardButton("1h", callback_data=f"chart_{sym}_1h_{chart_type}"),
-                        InlineKeyboardButton("4h", callback_data=f"chart_{sym}_4h_{chart_type}"),
-                        InlineKeyboardButton("1d", callback_data=f"chart_{sym}_1d_{chart_type}"),
-                    ],
-                    [
-                        InlineKeyboardButton("🕯️ Candles", callback_data=f"chart_{sym}_{interval}_candle"),
-                        InlineKeyboardButton("📈 Line / Area", callback_data=f"chart_{sym}_{interval}_line"),
-                    ]
-                ]
-                caption = f"📊 *{_escape_md(coin)}* ({interval.upper()}) • {'🕯️ Candles' if chart_type == 'candle' else '📈 Line'}"
+                caption, markup = _build_chart_ui(sym, interval, chart_type)
                 # If editing an existing chart message with photo, update in-place!
                 if query.message and getattr(query.message, "photo", None):
                     try:
-                        from telegram import InputMediaPhoto
                         import io
                         await query.edit_message_media(
                             media=InputMediaPhoto(media=io.BytesIO(chart_png), caption=caption, parse_mode="Markdown"),
-                            reply_markup=InlineKeyboardMarkup(kb),
+                            reply_markup=markup,
                         )
                         return
                     except Exception as e:
@@ -1723,7 +1750,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         photo=chart_png,
                         caption=caption,
                         parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup(kb),
+                        reply_markup=markup,
                     )
                 except Exception as e:
                     logger.error(f"Error sending chart via callback: {e}")

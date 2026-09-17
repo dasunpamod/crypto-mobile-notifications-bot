@@ -880,7 +880,55 @@ class TestCharts(unittest.TestCase):
                 self.assertEqual(candles[1]["close"], 98.5)
         _run(go())
 
-    def test_generate_chart_image_candle_and_line(self):
+    def test_tradingview_urls(self):
+        import charts
+        embed_url = charts.get_tradingview_embed_url("BTC", "1h")
+        self.assertIn("s.tradingview.com/widgetembed/", embed_url)
+        self.assertIn("BINANCE%3ABTCUSDT", embed_url)
+        self.assertIn("interval=60", embed_url)
+
+        web_url = charts.get_tradingview_web_url("SOL")
+        self.assertEqual(web_url, "https://www.tradingview.com/chart/?symbol=BINANCE:SOLUSDT")
+
+    def test_generate_chartimg_mock(self):
+        async def go():
+            import charts
+            from unittest.mock import AsyncMock, patch, MagicMock
+
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = b"fake_tv_png"
+            mock_resp.headers = {"content-type": "image/png"}
+
+            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_post.return_value = mock_resp
+                png = await charts.generate_chartimg_image("BTCUSDT", interval="1h")
+                self.assertEqual(png, b"fake_tv_png")
+                call_kwargs = mock_post.call_args[1]
+                self.assertIn("x-api-key", call_kwargs["headers"])
+                self.assertEqual(call_kwargs["json"]["symbol"], "BINANCE:BTCUSDT")
+                self.assertEqual(len(call_kwargs["json"]["studies"]), 3)
+        _run(go())
+
+    def test_generate_mplfinance_image(self):
+        async def go():
+            import charts
+            from unittest.mock import AsyncMock, patch
+
+            fake_candles = [
+                {"time": "12:00", "ts": 1700000000000 + i * 3600000, "open": 65000 + i * 10,
+                 "high": 65100 + i * 10, "low": 64900 + i * 10, "close": 65050 + i * 10, "volume": 100 + i}
+                for i in range(35)
+            ]
+
+            with patch("charts.fetch_klines", new_callable=AsyncMock) as mock_klines:
+                mock_klines.return_value = fake_candles
+                png = await charts.generate_mplfinance_image("BTCUSDT", interval="1h")
+                self.assertIsNotNone(png)
+                self.assertGreater(len(png), 1000)
+        _run(go())
+
+    def test_generate_quickchart_image_candle_and_line(self):
         async def go():
             import charts
             from unittest.mock import AsyncMock, patch, MagicMock
@@ -890,7 +938,6 @@ class TestCharts(unittest.TestCase):
                 {"time": "13:00", "ts": 1700003600000, "open": 65800.0, "high": 67000.0, "low": 65500.0, "close": 66500.0},
             ]
 
-            # Test candlestick chart generation
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             mock_resp.content = b"fake_candle_png"
@@ -900,28 +947,11 @@ class TestCharts(unittest.TestCase):
                 mock_klines.return_value = fake_candles
                 mock_post.return_value = mock_resp
 
-                png = await charts.generate_chart_image("BTCUSDT", interval="1h", chart_type="candle")
+                png = await charts.generate_quickchart_image("BTCUSDT", interval="1h", chart_type="candle")
                 self.assertEqual(png, b"fake_candle_png")
                 post_json = mock_post.call_args[1]["json"]
                 self.assertEqual(post_json["version"], "3")
                 self.assertEqual(post_json["chart"]["type"], "candlestick")
-                self.assertEqual(post_json["backgroundColor"], "#131722")
-
-            # Test line / area chart generation
-            mock_resp_line = MagicMock()
-            mock_resp_line.status_code = 200
-            mock_resp_line.content = b"fake_line_png"
-
-            with patch("charts.fetch_klines", new_callable=AsyncMock) as mock_klines, \
-                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-                mock_klines.return_value = fake_candles
-                mock_post.return_value = mock_resp_line
-
-                png_line = await charts.generate_chart_image("BTCUSDT", interval="4h", chart_type="line")
-                self.assertEqual(png_line, b"fake_line_png")
-                post_json_line = mock_post.call_args[1]["json"]
-                self.assertEqual(post_json_line["version"], "3")
-                self.assertEqual(post_json_line["chart"]["type"], "line")
         _run(go())
 
     def test_cmd_chart_command(self):
@@ -952,13 +982,16 @@ class TestCharts(unittest.TestCase):
                 self.assertEqual(kwargs["photo"], b"fake_chart_bytes")
                 self.assertIn("Line", kwargs["caption"])
                 kb = kwargs["reply_markup"].inline_keyboard
-                self.assertEqual(len(kb), 2)
+                self.assertEqual(len(kb), 3)
                 # Row 1: timeframes
                 self.assertEqual(len(kb[0]), 4)
-                # Row 2: styles
-                self.assertEqual(len(kb[1]), 2)
-                self.assertIn("chart_BTCUSDT_4h_candle", kb[1][0].callback_data)
-                self.assertIn("chart_BTCUSDT_4h_line", kb[1][1].callback_data)
+                # Row 2: styles (TV Snap, Tech TA, Clean, Line)
+                self.assertEqual(len(kb[1]), 4)
+                self.assertIn("chart_BTCUSDT_4h_tv", kb[1][0].callback_data)
+                self.assertIn("chart_BTCUSDT_4h_ta", kb[1][1].callback_data)
+                # Row 3: WebApp and External link
+                self.assertIsNotNone(kb[2][0].web_app)
+                self.assertIn("s.tradingview.com/widgetembed/", kb[2][0].web_app.url)
         _run(go())
 
     def test_chart_callback_inplace_edit(self):
@@ -968,7 +1001,7 @@ class TestCharts(unittest.TestCase):
 
             update = MagicMock()
             update.callback_query = MagicMock()
-            update.callback_query.data = "chart_BTCUSDT_4h_candle"
+            update.callback_query.data = "chart_BTCUSDT_4h_ta"
             update.callback_query.answer = AsyncMock()
             update.callback_query.message = MagicMock()
             update.callback_query.message.photo = [MagicMock()]  # message already has a photo
@@ -982,11 +1015,11 @@ class TestCharts(unittest.TestCase):
                 mock_gen.return_value = b"updated_chart_bytes"
                 await tb.handle_callback(update, context)
 
-                mock_gen.assert_called_once_with("BTCUSDT", interval="4h", chart_type="candle")
+                mock_gen.assert_called_once_with("BTCUSDT", interval="4h", chart_type="ta")
                 update.callback_query.edit_message_media.assert_called_once()
                 call_kwargs = update.callback_query.edit_message_media.call_args[1]
                 self.assertIn("reply_markup", call_kwargs)
-                self.assertEqual(len(call_kwargs["reply_markup"].inline_keyboard), 2)
+                self.assertEqual(len(call_kwargs["reply_markup"].inline_keyboard), 3)
         _run(go())
 
 
