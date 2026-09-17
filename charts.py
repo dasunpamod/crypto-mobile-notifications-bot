@@ -91,11 +91,13 @@ async def fetch_klines(symbol: str, interval: str = "1h", limit: int = 35) -> li
                 # Bybit returns most-recent first; reverse to chronological order
                 for row in reversed(raw_list):
                     try:
-                        ts = int(row[0]) / 1000.0
+                        ts_raw = int(row[0])
+                        ts = ts_raw / 1000.0
                         dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-                        time_str = dt.strftime("%d %b" if interval == "1d" else "%H:%M")
+                        time_str = dt.strftime("%d %b" if interval in ("1d", "1w") else "%H:%M")
                         candles.append({
                             "time": time_str,
+                            "ts": ts_raw,
                             "open": float(row[1]),
                             "high": float(row[2]),
                             "low": float(row[3]),
@@ -121,11 +123,13 @@ async def fetch_klines(symbol: str, interval: str = "1h", limit: int = 35) -> li
                 if isinstance(raw_list, list):
                     for row in raw_list:
                         try:
-                            ts = int(row[0]) / 1000.0
+                            ts_raw = int(row[0])
+                            ts = ts_raw / 1000.0
                             dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-                            time_str = dt.strftime("%d %b" if interval == "1d" else "%H:%M")
+                            time_str = dt.strftime("%d %b" if interval in ("1d", "1w") else "%H:%M")
                             candles.append({
                                 "time": time_str,
+                                "ts": ts_raw,
                                 "open": float(row[1]),
                                 "high": float(row[2]),
                                 "low": float(row[3]),
@@ -141,82 +145,139 @@ async def fetch_klines(symbol: str, interval: str = "1h", limit: int = 35) -> li
     return None
 
 
-async def generate_chart_image(symbol: str, interval: str = "1h", limit: int = 35) -> bytes | None:
-    """Generate a sleek TradingView-styled chart image (PNG bytes)."""
+async def generate_chart_image(symbol: str, interval: str = "1h", limit: int = 32, chart_type: str = "candle") -> bytes | None:
+    """Generate a sleek TradingView-styled chart image (PNG bytes).
+
+    Supports chart_type="candle" (default Japanese candlesticks) and chart_type="line" (sleek gradient area chart).
+    """
     candles = await fetch_klines(symbol, interval, limit=limit)
     if not candles:
         return None
 
-    labels = [c["time"] for c in candles]
     close_prices = [c["close"] for c in candles]
     latest_price = close_prices[-1]
     first_price = close_prices[0]
     pct_change = ((latest_price - first_price) / first_price * 100) if first_price > 0 else 0.0
-
+    period_high = max(c["high"] for c in candles)
+    period_low = min(c["low"] for c in candles)
     is_bullish = latest_price >= first_price
-    theme_color = "#26A69A" if is_bullish else "#EF5350"
-    fill_color = "rgba(38, 166, 154, 0.15)" if is_bullish else "rgba(239, 83, 80, 0.15)"
 
     from prices import format_price
-    price_str = format_price(latest_price)
-    title = f"{symbol} ({interval.upper()})  |  {price_str} ({pct_change:+.2f}%)"
+    coin = symbol.replace("USDT", "")
+    title = f"{coin} ({interval.upper()}) • {format_price(latest_price)} ({pct_change:+.2f}%)   H: {format_price(period_high)}  L: {format_price(period_low)}"
 
-    chart_config = {
-        "type": "line",
-        "data": {
-            "labels": labels,
-            "datasets": [{
-                "label": symbol,
-                "data": close_prices,
-                "borderColor": theme_color,
-                "borderWidth": 2.5,
-                "fill": True,
-                "backgroundColor": fill_color,
-                "pointRadius": 0,
-                "tension": 0.2
-            }]
-        },
-        "options": {
-            "responsive": True,
-            "plugins": {
-                "legend": {"display": False},
-                "title": {
-                    "display": True,
-                    "text": title,
-                    "fontColor": "#FFFFFF",
-                    "fontSize": 16,
-                    "fontStyle": "bold",
-                    "padding": 12
-                }
-            },
-            "scales": {
-                "xAxes": [{
-                    "gridLines": {"color": "rgba(255, 255, 255, 0.06)"},
-                    "ticks": {"fontColor": "#888888", "maxTicksLimit": 8}
-                }],
-                "yAxes": [{
-                    "gridLines": {"color": "rgba(255, 255, 255, 0.06)"},
-                    "ticks": {"fontColor": "#888888"}
+    time_unit = "day" if interval in ("1d", "1w") else "hour"
+    display_format = "dd MMM" if interval in ("1d", "1w") else "HH:mm"
+
+    if chart_type == "line":
+        line_color = "#00E676" if is_bullish else "#FF5252"
+        fill_color = "rgba(0, 230, 118, 0.12)" if is_bullish else "rgba(255, 82, 82, 0.12)"
+        chart_config = {
+            "type": "line",
+            "data": {
+                "labels": [c["time"] for c in candles],
+                "datasets": [{
+                    "label": "Price",
+                    "data": close_prices,
+                    "borderColor": line_color,
+                    "borderWidth": 2.5,
+                    "fill": True,
+                    "backgroundColor": fill_color,
+                    "pointRadius": 0,
+                    "tension": 0.35
                 }]
+            },
+            "options": {
+                "plugins": {
+                    "legend": {"display": False},
+                    "title": {
+                        "display": True,
+                        "text": title,
+                        "color": "#FFFFFF",
+                        "font": {"size": 14, "weight": "bold"},
+                        "padding": {"top": 10, "bottom": 15}
+                    }
+                },
+                "scales": {
+                    "x": {
+                        "grid": {"color": "rgba(255, 255, 255, 0.05)"},
+                        "ticks": {"color": "#9aa0a6", "maxTicksLimit": 7, "maxRotation": 0}
+                    },
+                    "y": {
+                        "grid": {"color": "rgba(255, 255, 255, 0.05)"},
+                        "ticks": {"color": "#9aa0a6"}
+                    }
+                }
             }
         }
-    }
+    else:
+        # Candlestick (TradingView style)
+        chart_config = {
+            "type": "candlestick",
+            "data": {
+                "datasets": [{
+                    "label": symbol,
+                    "data": [{"x": c.get("ts", 0), "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]} for c in candles],
+                    "color": {
+                        "up": "#26A69A",
+                        "down": "#EF5350",
+                        "unchanged": "#888888",
+                    }
+                }]
+            },
+            "options": {
+                "plugins": {
+                    "legend": {"display": False},
+                    "title": {
+                        "display": True,
+                        "text": title,
+                        "color": "#FFFFFF",
+                        "font": {"size": 14, "weight": "bold"},
+                        "padding": {"top": 10, "bottom": 15}
+                    }
+                },
+                "scales": {
+                    "x": {
+                        "type": "timeseries",
+                        "time": {
+                            "unit": time_unit,
+                            "displayFormats": {time_unit: display_format}
+                        },
+                        "grid": {"color": "rgba(255, 255, 255, 0.05)"},
+                        "ticks": {"color": "#9aa0a6", "maxTicksLimit": 7}
+                    },
+                    "y": {
+                        "grid": {"color": "rgba(255, 255, 255, 0.05)"},
+                        "ticks": {"color": "#9aa0a6"}
+                    }
+                }
+            }
+        }
 
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             resp = await client.post(
                 _QUICKCHART_URL,
                 json={
+                    "version": "3",
                     "chart": chart_config,
-                    "width": 640,
-                    "height": 340,
+                    "width": 720,
+                    "height": 400,
                     "backgroundColor": "#131722",
                     "devicePixelRatio": 2.0
                 }
             )
             if resp.status_code == 200 and resp.content:
                 return resp.content
+            # Fallback to line chart if candlestick rendering failed
+            if chart_type == "candle":
+                return await generate_chart_image(symbol, interval=interval, limit=limit, chart_type="line")
     except Exception as e:
         logger.warning(f"QuickChart generation error for {symbol}: {e}")
+        if chart_type == "candle":
+            try:
+                return await generate_chart_image(symbol, interval=interval, limit=limit, chart_type="line")
+            except Exception:
+                pass
 
     return None

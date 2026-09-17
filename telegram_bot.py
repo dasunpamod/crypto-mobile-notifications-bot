@@ -1001,17 +1001,23 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Invalid symbol `{_escape_md(raw_coin)}`.", parse_mode="Markdown")
         return
 
-    interval = args[1].lower() if len(args) > 1 else "1h"
+    interval = "1h"
+    chart_type = "candle"
     valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
-    if interval not in valid_intervals:
-        interval = "1h"
+    valid_types = {"candle": "candle", "candles": "candle", "candlestick": "candle",
+                   "line": "line", "area": "line"}
+    for arg in [a.lower() for a in args[1:]]:
+        if arg in valid_intervals:
+            interval = arg
+        elif arg in valid_types:
+            chart_type = valid_types[arg]
 
     try:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="upload_photo")
     except Exception:
         pass
 
-    chart_png = await charts.generate_chart_image(symbol, interval=interval)
+    chart_png = await charts.generate_chart_image(symbol, interval=interval, chart_type=chart_type)
     if not chart_png:
         await update.message.reply_text(
             f"Failed to generate chart for `{_escape_md(symbol)}`. Please try again in a moment.",
@@ -1022,15 +1028,20 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     coin = symbol.replace("USDT", "")
     kb = [
         [
-            InlineKeyboardButton("15m", callback_data=f"chart_{symbol}_15m"),
-            InlineKeyboardButton("1h", callback_data=f"chart_{symbol}_1h"),
-            InlineKeyboardButton("4h", callback_data=f"chart_{symbol}_4h"),
-            InlineKeyboardButton("1d", callback_data=f"chart_{symbol}_1d"),
+            InlineKeyboardButton("15m", callback_data=f"chart_{symbol}_15m_{chart_type}"),
+            InlineKeyboardButton("1h", callback_data=f"chart_{symbol}_1h_{chart_type}"),
+            InlineKeyboardButton("4h", callback_data=f"chart_{symbol}_4h_{chart_type}"),
+            InlineKeyboardButton("1d", callback_data=f"chart_{symbol}_1d_{chart_type}"),
+        ],
+        [
+            InlineKeyboardButton("🕯️ Candles", callback_data=f"chart_{symbol}_{interval}_candle"),
+            InlineKeyboardButton("📈 Line / Area", callback_data=f"chart_{symbol}_{interval}_line"),
         ]
     ]
+    caption = f"📊 *{_escape_md(coin)}* ({interval.upper()}) • {'🕯️ Candles' if chart_type == 'candle' else '📈 Line'}"
     await update.message.reply_photo(
         photo=chart_png,
-        caption=f"📊 *{_escape_md(coin)}* ({interval.upper()})",
+        caption=caption,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
@@ -1664,31 +1675,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("chart_"):
-        # chart_<symbol> or chart_<symbol>_<interval>
+        # chart_<symbol> or chart_<symbol>_<interval> or chart_<symbol>_<interval>_<type>
         parts = data.split("_")
         if len(parts) >= 2:
             sym = normalize_symbol(parts[1])
             interval = parts[2].lower() if len(parts) >= 3 else "1h"
+            chart_type = parts[3].lower() if len(parts) >= 4 else "candle"
             valid_intervals = ("15m", "30m", "1h", "2h", "4h", "1d", "1w")
             if interval not in valid_intervals:
                 interval = "1h"
-            await query.answer("Generating chart...")
-            chart_png = await charts.generate_chart_image(sym, interval=interval)
+            if chart_type not in ("candle", "line"):
+                chart_type = "candle"
+
+            await query.answer("Updating chart...")
+            chart_png = await charts.generate_chart_image(sym, interval=interval, chart_type=chart_type)
             if chart_png:
                 coin = sym.replace("USDT", "")
                 kb = [
                     [
-                        InlineKeyboardButton("15m", callback_data=f"chart_{sym}_15m"),
-                        InlineKeyboardButton("1h", callback_data=f"chart_{sym}_1h"),
-                        InlineKeyboardButton("4h", callback_data=f"chart_{sym}_4h"),
-                        InlineKeyboardButton("1d", callback_data=f"chart_{sym}_1d"),
+                        InlineKeyboardButton("15m", callback_data=f"chart_{sym}_15m_{chart_type}"),
+                        InlineKeyboardButton("1h", callback_data=f"chart_{sym}_1h_{chart_type}"),
+                        InlineKeyboardButton("4h", callback_data=f"chart_{sym}_4h_{chart_type}"),
+                        InlineKeyboardButton("1d", callback_data=f"chart_{sym}_1d_{chart_type}"),
+                    ],
+                    [
+                        InlineKeyboardButton("🕯️ Candles", callback_data=f"chart_{sym}_{interval}_candle"),
+                        InlineKeyboardButton("📈 Line / Area", callback_data=f"chart_{sym}_{interval}_line"),
                     ]
                 ]
+                caption = f"📊 *{_escape_md(coin)}* ({interval.upper()}) • {'🕯️ Candles' if chart_type == 'candle' else '📈 Line'}"
+                # If editing an existing chart message with photo, update in-place!
+                if query.message and getattr(query.message, "photo", None):
+                    try:
+                        from telegram import InputMediaPhoto
+                        import io
+                        await query.edit_message_media(
+                            media=InputMediaPhoto(media=io.BytesIO(chart_png), caption=caption, parse_mode="Markdown"),
+                            reply_markup=InlineKeyboardMarkup(kb),
+                        )
+                        return
+                    except Exception as e:
+                        logger.debug(f"edit_message_media failed ({e}), falling back to send_photo")
+
                 try:
                     await context.bot.send_photo(
                         chat_id=query.message.chat_id,
                         photo=chart_png,
-                        caption=f"📊 *{_escape_md(coin)}* ({interval.upper()})",
+                        caption=caption,
                         parse_mode="Markdown",
                         reply_markup=InlineKeyboardMarkup(kb),
                     )

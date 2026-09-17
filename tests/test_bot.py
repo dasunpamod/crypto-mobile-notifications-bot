@@ -880,6 +880,115 @@ class TestCharts(unittest.TestCase):
                 self.assertEqual(candles[1]["close"], 98.5)
         _run(go())
 
+    def test_generate_chart_image_candle_and_line(self):
+        async def go():
+            import charts
+            from unittest.mock import AsyncMock, patch, MagicMock
+
+            fake_candles = [
+                {"time": "12:00", "ts": 1700000000000, "open": 65000.0, "high": 66000.0, "low": 64500.0, "close": 65800.0},
+                {"time": "13:00", "ts": 1700003600000, "open": 65800.0, "high": 67000.0, "low": 65500.0, "close": 66500.0},
+            ]
+
+            # Test candlestick chart generation
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.content = b"fake_candle_png"
+
+            with patch("charts.fetch_klines", new_callable=AsyncMock) as mock_klines, \
+                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_klines.return_value = fake_candles
+                mock_post.return_value = mock_resp
+
+                png = await charts.generate_chart_image("BTCUSDT", interval="1h", chart_type="candle")
+                self.assertEqual(png, b"fake_candle_png")
+                post_json = mock_post.call_args[1]["json"]
+                self.assertEqual(post_json["version"], "3")
+                self.assertEqual(post_json["chart"]["type"], "candlestick")
+                self.assertEqual(post_json["backgroundColor"], "#131722")
+
+            # Test line / area chart generation
+            mock_resp_line = MagicMock()
+            mock_resp_line.status_code = 200
+            mock_resp_line.content = b"fake_line_png"
+
+            with patch("charts.fetch_klines", new_callable=AsyncMock) as mock_klines, \
+                 patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                mock_klines.return_value = fake_candles
+                mock_post.return_value = mock_resp_line
+
+                png_line = await charts.generate_chart_image("BTCUSDT", interval="4h", chart_type="line")
+                self.assertEqual(png_line, b"fake_line_png")
+                post_json_line = mock_post.call_args[1]["json"]
+                self.assertEqual(post_json_line["version"], "3")
+                self.assertEqual(post_json_line["chart"]["type"], "line")
+        _run(go())
+
+    def test_cmd_chart_command(self):
+        async def go():
+            from unittest.mock import AsyncMock, patch, MagicMock
+            import telegram_bot as tb
+
+            tb._last_cmd_at.clear()
+            update = MagicMock()
+            update.message = MagicMock()
+            update.message.reply_photo = AsyncMock()
+            update.message.reply_text = AsyncMock()
+            update.effective_user.id = 123
+            update.effective_chat.id = 123
+            context = MagicMock()
+            context.args = ["BTC", "4h", "line"]
+            context.bot = MagicMock()
+            context.bot.send_chat_action = AsyncMock()
+
+            with patch("telegram_bot.config.TELEGRAM_USER_ID", 123), \
+                 patch("charts.generate_chart_image", new_callable=AsyncMock) as mock_gen:
+                mock_gen.return_value = b"fake_chart_bytes"
+                await tb.cmd_chart(update, context)
+
+                mock_gen.assert_called_once_with("BTCUSDT", interval="4h", chart_type="line")
+                update.message.reply_photo.assert_called_once()
+                kwargs = update.message.reply_photo.call_args[1]
+                self.assertEqual(kwargs["photo"], b"fake_chart_bytes")
+                self.assertIn("Line", kwargs["caption"])
+                kb = kwargs["reply_markup"].inline_keyboard
+                self.assertEqual(len(kb), 2)
+                # Row 1: timeframes
+                self.assertEqual(len(kb[0]), 4)
+                # Row 2: styles
+                self.assertEqual(len(kb[1]), 2)
+                self.assertIn("chart_BTCUSDT_4h_candle", kb[1][0].callback_data)
+                self.assertIn("chart_BTCUSDT_4h_line", kb[1][1].callback_data)
+        _run(go())
+
+    def test_chart_callback_inplace_edit(self):
+        async def go():
+            from unittest.mock import AsyncMock, patch, MagicMock
+            import telegram_bot as tb
+
+            update = MagicMock()
+            update.callback_query = MagicMock()
+            update.callback_query.data = "chart_BTCUSDT_4h_candle"
+            update.callback_query.answer = AsyncMock()
+            update.callback_query.message = MagicMock()
+            update.callback_query.message.photo = [MagicMock()]  # message already has a photo
+            update.callback_query.edit_message_media = AsyncMock()
+            update.effective_user.id = 123
+            context = MagicMock()
+            context.bot_data = {"engine": None}
+
+            with patch("telegram_bot.config.TELEGRAM_USER_ID", 123), \
+                 patch("charts.generate_chart_image", new_callable=AsyncMock) as mock_gen:
+                mock_gen.return_value = b"updated_chart_bytes"
+                await tb.handle_callback(update, context)
+
+                mock_gen.assert_called_once_with("BTCUSDT", interval="4h", chart_type="candle")
+                update.callback_query.edit_message_media.assert_called_once()
+                call_kwargs = update.callback_query.edit_message_media.call_args[1]
+                self.assertIn("reply_markup", call_kwargs)
+                self.assertEqual(len(call_kwargs["reply_markup"].inline_keyboard), 2)
+        _run(go())
+
 
 class TestWebhookServer(unittest.TestCase):
     def test_http_request_parsing(self):
