@@ -9,6 +9,7 @@ Provides:
 - Market Sentiment: get_fear_and_greed()
 """
 
+import asyncio
 import datetime
 import gc
 import io
@@ -240,16 +241,14 @@ async def generate_chartimg_image(symbol: str, interval: str = "1h") -> bytes | 
 # Engine 2: mplfinance (Option 2 - Institutional TA with Volume, EMA, RSI)
 # ---------------------------------------------------------------------------
 
-async def generate_mplfinance_image(symbol: str, interval: str = "1h", limit: int = 38) -> bytes | None:
-    """Generate a rich dark-mode technical analysis chart using mplfinance."""
-    candles = await fetch_klines(symbol, interval, limit=limit)
-    if not candles:
-        return None
-
+def _render_mplfinance_sync(candles: list, symbol: str, interval: str) -> bytes | None:
+    """Synchronous CPU-bound renderer for mplfinance with headless backend."""
     try:
-        import pandas as pd
-        import mplfinance as mpf
+        import matplotlib
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import mplfinance as mpf
+        import pandas as pd
 
         dates = [
             datetime.datetime.fromtimestamp(c["ts"] / 1000.0, tz=datetime.timezone.utc)
@@ -327,8 +326,15 @@ async def generate_mplfinance_image(symbol: str, interval: str = "1h", limit: in
             gc.collect()
         except Exception:
             pass
+        return None
 
-    return None
+
+async def generate_mplfinance_image(symbol: str, interval: str = "1h", limit: int = 38) -> bytes | None:
+    """Generate a rich dark-mode technical analysis chart using mplfinance asynchronously in a thread."""
+    candles = await fetch_klines(symbol, interval, limit=limit)
+    if not candles:
+        return None
+    return await asyncio.to_thread(_render_mplfinance_sync, candles, symbol, interval)
 
 
 # ---------------------------------------------------------------------------

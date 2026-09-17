@@ -195,6 +195,47 @@ async def _safe_reply_md(target_msg, text: str, reply_markup=None):
         return await target_msg.reply_text(plain, reply_markup=reply_markup)
 
 
+def _get_target_msg(update: Update):
+    if update.message:
+        return update.message
+    if update.callback_query and update.callback_query.message:
+        return update.callback_query.message
+    return None
+
+
+async def _reply_text(update: Update, text: str, parse_mode: str = None, reply_markup=None):
+    """Safely send text reply to either a direct message or a callback query."""
+    msg = _get_target_msg(update)
+    if msg:
+        if parse_mode == "Markdown":
+            return await _safe_reply_md(msg, text, reply_markup=reply_markup)
+        return await msg.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+
+async def _reply_doc(update: Update, context: ContextTypes.DEFAULT_TYPE, document, caption: str = ""):
+    """Safely send document reply to chat_id or target message."""
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if chat_id:
+        return await context.bot.send_document(chat_id=chat_id, document=document, caption=caption)
+    msg = _get_target_msg(update)
+    if msg and hasattr(msg, "reply_document"):
+        return await msg.reply_document(document=document, caption=caption)
+
+
+async def _should_keep_subscribed(symbol: str) -> bool:
+    """Check if a symbol should remain subscribed to the WebSocket feed."""
+    try:
+        if await db.is_watched(symbol):
+            return True
+        watchlist_cfg = getattr(config, "WATCHLIST_SYMBOLS", ()) or ()
+        if symbol in watchlist_cfg:
+            return True
+        remaining = await db.get_alerts_for_symbol(symbol)
+        return bool(remaining)
+    except Exception:
+        return False
+
+
 async def _resolve_symbol(coin_or_symbol: str, engine=None) -> tuple | None:
     """Normalize + verify a symbol. Returns (symbol, price)."""
     symbol = normalize_symbol(coin_or_symbol)
@@ -621,10 +662,21 @@ async def _render_alert_editor(alert_id: int) -> tuple[str, InlineKeyboardMarkup
     snoozed = db.alert_field(alert, "snoozed_until")
     coin = _escape_md(symbol.replace("USDT", ""))
 
+    target_str = format_price(target)
+    if atype == "trail":
+        pct = db.alert_field(alert, "pct", 0)
+        target_str = f"Trailing Stop (-{pct:g}% from peak)"
+    elif atype == "move":
+        pct = db.alert_field(alert, "pct", 0)
+        win = db.alert_field(alert, "window_min", 15)
+        target_str = f"Move Alert (±{pct:g}% in {win}m)"
+    elif atype == "funding":
+        target_str = "Funding Rate alert"
+
     lines = [
         f"⚙️ *Manage Alert #{alert_id}*",
         f"• Coin: *{coin}*",
-        f"• Target: *{condition.upper()}* `{format_price(target)}`",
+        f"• Target: *{condition.upper()}* `{target_str}`" if atype == "price" else f"• Type: *{target_str}*",
         f"• Mode: {'🔁 Repeat' if is_persistent else '🎯 Once'}",
         f"• Siren: {'🚨 ENABLED (Loud)' if is_urgent else '🔕 Standard'}",
     ]
@@ -646,17 +698,19 @@ async def _render_alert_editor(alert_id: int) -> tuple[str, InlineKeyboardMarkup
         callback_data=f"edit_flip_{alert_id}"
     )
 
-    kb = [
-        [
+    kb = []
+    if atype == "price":
+        kb.append([
             InlineKeyboardButton("➕ +1%", callback_data=f"edittgt_{alert_id}_1"),
             InlineKeyboardButton("➕ +5%", callback_data=f"edittgt_{alert_id}_5"),
             InlineKeyboardButton("➖ -1%", callback_data=f"edittgt_{alert_id}_-1"),
             InlineKeyboardButton("➖ -5%", callback_data=f"edittgt_{alert_id}_-5"),
-        ],
-        [
+        ])
+        kb.append([
             flip_btn,
             InlineKeyboardButton("✏️ Custom Price", callback_data=f"edit_custom_{alert_id}"),
-        ],
+        ])
+    kb.extend([
         [
             siren_btn,
             repeat_btn,
@@ -670,7 +724,7 @@ async def _render_alert_editor(alert_id: int) -> tuple[str, InlineKeyboardMarkup
             InlineKeyboardButton("❌ Delete Alert", callback_data=f"remove_{alert_id}"),
             InlineKeyboardButton("📋 Back to List", callback_data="hub_alerts"),
         ],
-    ]
+    ])
     return "\n".join(lines), InlineKeyboardMarkup(kb)
 
 
@@ -1100,8 +1154,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     symbol = alert[1]
     await db.remove_alert(alert_id)
 
-    remaining = await db.get_alerts_for_symbol(symbol)
-    if not remaining:
+    if not await _should_keep_subscribed(symbol):
         ws = context.bot_data["ws"]
         await ws.unsubscribe(symbol)
 
@@ -1129,7 +1182,8 @@ async def cmd_removeall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     count = await db.remove_all_alerts()
     ws = context.bot_data["ws"]
     for symbol in symbols:
-        await ws.unsubscribe(symbol)
+        if not await _should_keep_subscribed(symbol):
+            await ws.unsubscribe(symbol)
     await update.message.reply_text(f"Removed all {count} alert(s).")
 
 
@@ -1602,16 +1656,16 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             pass
     rows = await db.get_fired_history(n)
     if not rows:
-        await update.message.reply_text("No fired alerts yet.")
+        await _reply_text(update, "No fired alerts yet.")
         return
     lines = ["*Recently fired*\n"]
     for aid, symbol, condition, target, price, detail, fired_at in rows:
         coin = _escape_md((symbol or "").replace("USDT", ""))
-        extra = f" {detail}" if detail else ""
+        extra = f" {_escape_md(detail)}" if detail else ""
         lines.append(
             f"  #{aid} *{coin}* {condition} {format_price(target)}"
             f" @ {format_price(price)}{extra} — {_fmt_ts(fired_at)}")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _reply_text(update, "\n".join(lines), parse_mode="Markdown")
 
 
 @authorized
@@ -1652,7 +1706,7 @@ async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(("Stale: " + ", ".join(stale[:8])) if stale else "Streams: fresh")
     except Exception:
         pass
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await _reply_text(update, "\n".join(lines), parse_mode="Markdown")
 
 
 @authorized
@@ -1737,7 +1791,7 @@ async def cmd_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/export — send alerts + watchlist as a JSON backup file."""
     if update.effective_chat and update.effective_chat.type != "private":
-        await update.message.reply_text("This command can only be used in a private chat with the bot.")
+        await _reply_text(update, "This command can only be used in a private chat with the bot.")
         return
     import io
     import json
@@ -1752,39 +1806,47 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         data["watchlist"] = []
     buf = io.BytesIO(json.dumps(data, indent=2, default=str).encode("utf-8"))
     buf.name = "alerts-backup.json"
-    await update.message.reply_document(document=buf, caption=f"Backup: {len(alerts)} alert(s).")
+    await _reply_doc(update, context, document=buf, caption=f"Backup: {len(alerts)} alert(s).")
 
 
 @authorized
 async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/import — reply to a JSON backup file with /import to restore."""
     doc = None
-    if update.message.reply_to_message and update.message.reply_to_message.document:
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.document:
         doc = update.message.reply_to_message.document
     if not doc:
-        await update.message.reply_text("Reply to your backup JSON file with `/import`.", parse_mode="Markdown")
+        await _reply_text(update, "Reply to your backup JSON file with `/import`.", parse_mode="Markdown")
         return
     try:
         f = await doc.get_file()
         raw = await f.download_as_bytearray()
     except Exception as e:
-        await update.message.reply_text(f"Could not download file: {e}")
+        await _reply_text(update, f"Could not download file: {e}")
         return
     import json
     try:
         data = json.loads(bytes(raw).decode("utf-8"))
     except Exception:
-        await update.message.reply_text("That file is not valid JSON.")
+        await _reply_text(update, "That file is not valid JSON.")
         return
     items = data.get("alerts") if isinstance(data, dict) else None
     if not isinstance(items, list):
-        await update.message.reply_text("Backup has no `alerts` list.")
+        await _reply_text(update, "Backup has no `alerts` list.")
         return
     ws = context.bot_data["ws"]
     engine = context.bot_data["engine"]
     made, skipped = 0, 0
+    curr_alerts = await db.count_alerts()
+    max_cap = _max_alerts()
+    if curr_alerts >= max_cap:
+        await _reply_text(update, f"Alert limit reached ({max_cap}). Delete some alerts before importing.")
+        return
     for item in items[:100]:
         try:
+            if curr_alerts + made >= max_cap:
+                skipped += 1
+                continue
             symbol = normalize_symbol(str(item.get("symbol", "")))
             target = float(item.get("target", 0))
             condition = str(item.get("condition", "above")).lower()
@@ -1819,25 +1881,25 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await db.add_watch(sym)
         except Exception:
             pass
-    await update.message.reply_text(f"Imported {made} alert(s){f', skipped {skipped}' if skipped else ''}.")
+    await _reply_text(update, f"Imported {made} alert(s){f', skipped {skipped}' if skipped else ''}.")
 
 
 @authorized
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/backup — send the raw SQLite database file."""
     if update.effective_chat and update.effective_chat.type != "private":
-        await update.message.reply_text("This command can only be used in a private chat with the bot.")
+        await _reply_text(update, "This command can only be used in a private chat with the bot.")
         return
     import os as _os
     if not _os.path.exists(db.DB_PATH):
-        await update.message.reply_text("No database file yet.")
+        await _reply_text(update, "No database file yet.")
         return
     try:
         await db.checkpoint_wal()
         with open(db.DB_PATH, "rb") as f:
-            await update.message.reply_document(document=f, caption="Database backup.")
+            await _reply_doc(update, context, document=f, caption="Database backup.")
     except Exception as e:
-        await update.message.reply_text(f"Backup failed: {e}")
+        await _reply_text(update, f"Backup failed: {e}")
 
 
 @authorized
@@ -1849,10 +1911,10 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     import sys
 
     if not update.effective_user or update.effective_user.id != config.TELEGRAM_USER_ID:
-        await update.message.reply_text("Unauthorized: only the bot owner can update.")
+        await _reply_text(update, "Unauthorized: only the bot owner can update.")
         return
 
-    msg = await update.message.reply_text("🔄 Checking for updates from GitHub...")
+    msg = await _reply_text(update, "🔄 Checking for updates from GitHub...")
     repo_dir = os.path.dirname(os.path.abspath(__file__))
 
     try:
@@ -1939,8 +2001,8 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Invalid numbers. Use: `/grid BTC 70000 80000 5`.", parse_mode="Markdown")
         return
 
-    if low <= 0 or high <= 0 or low >= high:
-        await update.message.reply_text("Error: `<low>` must be positive and less than `<high>`.")
+    if low <= 0 or high <= 0 or low >= high or high > MAX_PRICE_VALUE:
+        await update.message.reply_text(f"Error: `<low>` must be positive, less than `<high>`, and high must not exceed {format_price(MAX_PRICE_VALUE)}.")
         return
 
     if not (2 <= count <= 10):
@@ -1999,6 +2061,26 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+_MENU_LABELS = (
+    "Dashboard", "⚡ Dashboard", "My Alerts", "📋 My Alerts", "List Alerts",
+    "Prices", "💰 Prices", "Check Price", "Add Alert", "➕ Set Alert", "Set Alert",
+    "Remove Alert", "Pause", "Resume", "Pause Alerts", "Resume Alerts",
+    "Help", "Movers", "📊 Movers", "History", "📜 History", "Watchlist", "👁️ Watchlist",
+    "Tools", "🛠️ Tools"
+)
+
+
+@authorized
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel — cancel any active interactive prompts or wizards."""
+    active = False
+    for key in ("editing_alert_target", "awaiting_watch_coin", "awaiting_custom_price", "is_urgent"):
+        if context.user_data.pop(key, None) is not None:
+            active = True
+    msg = "Action cancelled." if active else "No active action to cancel."
+    await _reply_text(update, msg)
+
+
 # ---------------------------------------------------------------------------
 # Interactive UI Handlers
 # ---------------------------------------------------------------------------
@@ -2012,61 +2094,68 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # State 1: Editing target price from Alert Editor deck
     editing_id = context.user_data.get("editing_alert_target")
     if editing_id:
-        context.user_data.pop("editing_alert_target", None)
-        try:
-            val = float(text.replace(",", "").strip())
-            if not (0 < val <= MAX_PRICE_VALUE):
-                await update.message.reply_text("Price is out of range.")
+        if any(label in text for label in _MENU_LABELS) or text.startswith("/"):
+            context.user_data.pop("editing_alert_target", None)
+        else:
+            context.user_data.pop("editing_alert_target", None)
+            try:
+                val = float(text.replace(",", "").strip())
+                if not (0 < val <= MAX_PRICE_VALUE):
+                    await update.message.reply_text("Price is out of range.")
+                    return
+                alert = await db.get_alert(editing_id)
+                if not alert:
+                    await update.message.reply_text(f"Alert #{editing_id} not found.")
+                    return
+                atype = db.alert_field(alert, "alert_type", "price") or "price"
+                if atype != "price":
+                    await update.message.reply_text("Target editing is only supported for price alerts.")
+                    return
+                condition = db.alert_field(alert, "condition", "above")
+                await db.set_target(editing_id, val, condition)
+                ed_res = await _render_alert_editor(editing_id)
+                if ed_res:
+                    txt, kb = ed_res
+                    await update.message.reply_text(
+                        f"✅ Alert #{editing_id} target updated to *{format_price(val)}*.\n\n" + txt,
+                        parse_mode="Markdown",
+                        reply_markup=kb,
+                    )
+                else:
+                    await update.message.reply_text(f"Alert #{editing_id} target updated to {format_price(val)}.")
                 return
-            alert = await db.get_alert(editing_id)
-            if not alert:
-                await update.message.reply_text(f"Alert #{editing_id} not found.")
+            except ValueError:
+                await update.message.reply_text("Invalid price format. Edit cancelled.")
                 return
-            condition = db.alert_field(alert, "condition", "above")
-            await db.set_target(editing_id, val, condition)
-            ed_res = await _render_alert_editor(editing_id)
-            if ed_res:
-                txt, kb = ed_res
-                await update.message.reply_text(
-                    f"✅ Alert #{editing_id} target updated to *{format_price(val)}*.\n\n" + txt,
-                    parse_mode="Markdown",
-                    reply_markup=kb,
-                )
-            else:
-                await update.message.reply_text(f"Alert #{editing_id} target updated to {format_price(val)}.")
-            return
-        except ValueError:
-            await update.message.reply_text("Invalid price format. Edit cancelled.")
-            return
 
     # State 2: Adding a custom coin to Watchlist
     if context.user_data.get("awaiting_watch_coin"):
-        context.user_data.pop("awaiting_watch_coin", None)
-        sym = normalize_symbol(text)
-        if is_valid_symbol(sym):
-            p = await get_current_price(sym)
-            if p is None and engine:
-                p = engine.get_fresh_price(sym, max_age_sec=30)
-            if p is not None:
-                await db.add_watch(sym)
-                ws = context.bot_data.get("ws")
-                if ws:
-                    await ws.subscribe(sym)
-                coin_clean = sym.replace("USDT", "")
-                await update.message.reply_text(f"✅ Added *{coin_clean}* to watchlist!", parse_mode="Markdown")
-                txt, kb = await _render_watch_deck(engine)
-                await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
-                return
-        await update.message.reply_text(f"Could not find valid coin `{_escape_md(text)}`.", parse_mode="Markdown")
-        return
+        if any(label in text for label in _MENU_LABELS) or text.startswith("/"):
+            context.user_data.pop("awaiting_watch_coin", None)
+        else:
+            context.user_data.pop("awaiting_watch_coin", None)
+            sym = normalize_symbol(text)
+            if is_valid_symbol(sym):
+                p = await get_current_price(sym)
+                if p is None and engine:
+                    p = engine.get_fresh_price(sym, max_age_sec=30)
+                if p is not None:
+                    await db.add_watch(sym)
+                    ws = context.bot_data.get("ws")
+                    if ws:
+                        await ws.subscribe(sym)
+                    coin_clean = sym.replace("USDT", "")
+                    await update.message.reply_text(f"✅ Added *{coin_clean}* to watchlist!", parse_mode="Markdown")
+                    txt, kb = await _render_watch_deck(engine)
+                    await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=kb)
+                    return
+            await update.message.reply_text(f"Could not find valid coin `{_escape_md(text)}`.", parse_mode="Markdown")
+            return
 
     # State 3: Custom Price Wizard
     awaiting_coin = context.user_data.get("awaiting_custom_price")
     if awaiting_coin:
-        menu_labels = ("Dashboard", "My Alerts", "List Alerts", "Prices", "Check Price", "Add Alert",
-                       "Set Alert", "Remove Alert", "Pause", "Resume", "Pause Alerts", "Resume Alerts",
-                       "Help", "Movers", "History")
-        if any(label in text for label in menu_labels) or text.startswith("/"):
+        if any(label in text for label in _MENU_LABELS) or text.startswith("/"):
             context.user_data.pop("awaiting_custom_price", None)  # Cancel wizard
             context.user_data.pop("is_urgent", None)
         else:
@@ -2225,10 +2314,33 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle all inline button clicks."""
     query = update.callback_query
+    if not query:
+        return
+
+    _orig_answer = query.answer
+    _query_answered = False
+
+    async def _wrapped_answer(*args, **kwargs):
+        nonlocal _query_answered
+        if _query_answered:
+            return
+        _query_answered = True
+        return await _orig_answer(*args, **kwargs)
+
+    query.answer = _wrapped_answer
+
     try:
-        await query.answer()
-    except Exception:
-        pass
+        await _dispatch_callback(query, update, context)
+    finally:
+        if not _query_answered:
+            try:
+                await _orig_answer()
+            except Exception:
+                pass
+        query.answer = _orig_answer
+
+
+async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     data = query.data or ""
     engine = context.bot_data["engine"]
 
@@ -2438,6 +2550,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("wiz_add_pct_"):
+        if await db.count_alerts() >= _max_alerts():
+            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            return
         parts = data.split("_")
         coin = parts[3].upper()
         pct = float(parts[4])
@@ -2471,6 +2586,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("wiz_add_trail_"):
+        if await db.count_alerts() >= _max_alerts():
+            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            return
         parts = data.split("_")
         coin = parts[3].upper()
         pct = float(parts[4])
@@ -2500,6 +2618,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("wiz_add_move_"):
+        if await db.count_alerts() >= _max_alerts():
+            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            return
         parts = data.split("_")
         coin = parts[3].upper()
         pct = float(parts[4])
@@ -2534,6 +2655,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         coin = parts[2].upper()
         spread = float(parts[3])
         levels = int(parts[4])
+        if await db.count_alerts() + levels > _max_alerts():
+            await query.answer(f"Not enough room (limit {_max_alerts()}).", show_alert=True)
+            return
         sym = normalize_symbol(coin)
         price = await get_current_price(sym)
         if price is None and engine:
@@ -2575,6 +2699,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data.startswith("quick_add_"):
+        if await db.count_alerts() >= _max_alerts():
+            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            return
         # quick_add_<symbol>_<condition>_<target>
         parts = data.split("_")
         if len(parts) >= 5:
@@ -2623,8 +2750,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 if alert:
                     sym = alert[1]
                     await db.remove_alert(aid)
-                    remaining = await db.get_alerts_for_symbol(sym)
-                    if not remaining:
+                    if not await _should_keep_subscribed(sym):
                         ws = context.bot_data["ws"]
                         await ws.unsubscribe(sym)
                     await query.answer(f"❌ Alert #{aid} removed")
@@ -2721,6 +2847,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data.startswith("edit_custom_"):
         try:
             alert_id = int(data.split("_")[2])
+            alert = await db.get_alert(alert_id)
+            if not alert:
+                await query.answer("Alert not found.", show_alert=True)
+                return
+            atype = db.alert_field(alert, "alert_type", "price") or "price"
+            if atype != "price":
+                await query.answer("Custom price is only supported for price alerts.", show_alert=True)
+                return
             context.user_data["editing_alert_target"] = alert_id
             await query.edit_message_text(
                 f"✏️ *Editing Target Price for Alert #{alert_id}*\n\n"
@@ -2739,6 +2873,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 delta = float(parts[2])
                 alert = await db.get_alert(aid)
                 if alert:
+                    atype = db.alert_field(alert, "alert_type", "price") or "price"
+                    if atype != "price":
+                        await query.answer("Target adjustment is only supported for price alerts.", show_alert=True)
+                        return
                     cur_tgt = db.alert_field(alert, "target", 0)
                     cond = db.alert_field(alert, "condition", "above")
                     new_tgt = cur_tgt * (1 + delta / 100)
@@ -2756,6 +2894,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             aid = int(data.split("_")[2])
             alert = await db.get_alert(aid)
             if alert:
+                atype = db.alert_field(alert, "alert_type", "price") or "price"
+                if atype != "price":
+                    await query.answer("Condition flip is only supported for price alerts.", show_alert=True)
+                    return
                 cur_tgt = db.alert_field(alert, "target", 0)
                 cond = db.alert_field(alert, "condition", "above")
                 new_cond = "below" if cond == "above" else "above"
@@ -2837,7 +2979,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             count = await db.remove_all_alerts()
             ws = context.bot_data["ws"]
             for symbol in symbols:
-                await ws.unsubscribe(symbol)
+                if not await _should_keep_subscribed(symbol):
+                    await ws.unsubscribe(symbol)
             try:
                 await query.edit_message_text(f"Removed all {count} alert(s).", reply_markup=None)
             except Exception:
@@ -2856,8 +2999,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if alert:
                 symbol = alert[1]
                 await db.remove_alert(alert_id)
-                remaining = await db.get_alerts_for_symbol(symbol)
-                if not remaining:
+                if not await _should_keep_subscribed(symbol):
                     ws = context.bot_data["ws"]
                     await ws.unsubscribe(symbol)
                 text, markup = await get_list_text_and_markup(engine)
@@ -2876,6 +3018,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     pass
         except Exception as e:
             logger.error(f"Error handling remove: {e}")
+        return
 
     elif data.startswith("price_") or data.startswith("refresh_price_"):
         coin = (data.split("_")[-1] or "").upper()
@@ -3032,6 +3175,7 @@ async def _post_init(application: Application) -> None:
         BotCommand("export", "Export alerts as JSON backup"),
         BotCommand("import", "Import alerts from JSON backup"),
         BotCommand("backup", "Download SQLite database file"),
+        BotCommand("cancel", "Cancel current prompt or wizard"),
     ]
     try:
         await application.bot.set_my_commands(commands)
@@ -3052,6 +3196,7 @@ def create_bot(alert_engine, binance_ws) -> Application:
     app.add_handler(CommandHandler("menu", cmd_dashboard))
     app.add_handler(CommandHandler("hub", cmd_dashboard))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("urgent", cmd_urgent))
     app.add_handler(CommandHandler("siren", cmd_urgent))

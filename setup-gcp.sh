@@ -45,6 +45,7 @@ NTFY_TOPIC=$NTFY_TOPIC
 NTFY_SERVER=https://ntfy.sh
 SEND_TELEGRAM_ALERTS=false
 EOF
+chmod 600 .env
 
 echo "✅ Configuration saved to .env"
 
@@ -76,7 +77,7 @@ echo "────────────────────────�
 echo ""
 echo "  Now upload your Python files to: $PROJECT_DIR"
 echo "  (config.py, database.py, prices.py, binance_ws.py, alert_engine.py,"
-echo "   telegram_bot.py, notifier.py, main.py)"
+echo "   telegram_bot.py, notifier.py, charts.py, webhook_server.py, main.py)"
 echo ""
 echo "  Then start the bot with:"
 echo "    sudo systemctl enable crypto-alerts"

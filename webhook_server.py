@@ -51,11 +51,57 @@ def _escape_md(text: str) -> str:
     return text
 
 
+MAX_BODY_SIZE = 65536
+MAX_HEADER_SIZE = 8192
+
+
+async def _read_http_request(reader: asyncio.StreamReader) -> bytes:
+    """Read a complete HTTP request including headers and content-length body."""
+    buffer = bytearray()
+    while b"\r\n\r\n" not in buffer and b"\n\n" not in buffer:
+        if len(buffer) > MAX_HEADER_SIZE:
+            return b""
+        chunk = await reader.read(1024)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+
+    if b"\r\n\r\n" in buffer:
+        sep = b"\r\n\r\n"
+    elif b"\n\n" in buffer:
+        sep = b"\n\n"
+    else:
+        return bytes(buffer)
+
+    header_bytes, body_bytes = buffer.split(sep, 1)
+    headers_text = header_bytes.decode("utf-8", errors="replace")
+    content_length = 0
+    for line in headers_text.splitlines()[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            if k.strip().lower() == "content-length":
+                try:
+                    content_length = int(v.strip())
+                except ValueError:
+                    content_length = 0
+                break
+
+    if content_length > MAX_BODY_SIZE:
+        return b""
+
+    needed = content_length - len(body_bytes)
+    if needed > 0:
+        extra_body = await reader.readexactly(needed)
+        body_bytes.extend(extra_body)
+
+    return bytes(header_bytes + sep + body_bytes)
+
+
 async def _handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, telegram_bot=None) -> None:
     try:
         try:
-            data = await asyncio.wait_for(reader.read(65536), timeout=10.0)
-        except asyncio.TimeoutError:
+            data = await asyncio.wait_for(_read_http_request(reader), timeout=10.0)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError):
             writer.close()
             await writer.wait_closed()
             return

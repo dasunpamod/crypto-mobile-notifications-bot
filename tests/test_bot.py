@@ -900,14 +900,15 @@ class TestCharts(unittest.TestCase):
             mock_resp.content = b"fake_tv_png"
             mock_resp.headers = {"content-type": "image/png"}
 
-            with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-                mock_post.return_value = mock_resp
-                png = await charts.generate_chartimg_image("BTCUSDT", interval="1h")
-                self.assertEqual(png, b"fake_tv_png")
-                call_kwargs = mock_post.call_args[1]
-                self.assertIn("x-api-key", call_kwargs["headers"])
-                self.assertEqual(call_kwargs["json"]["symbol"], "BINANCE:BTCUSDT")
-                self.assertEqual(len(call_kwargs["json"]["studies"]), 3)
+            with patch("config.CHART_IMG_API_KEY", "test_key"), patch("charts.config.CHART_IMG_API_KEY", "test_key"):
+                with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+                    mock_post.return_value = mock_resp
+                    png = await charts.generate_chartimg_image("BTCUSDT", interval="1h")
+                    self.assertEqual(png, b"fake_tv_png")
+                    call_kwargs = mock_post.call_args[1]
+                    self.assertIn("x-api-key", call_kwargs["headers"])
+                    self.assertEqual(call_kwargs["json"]["symbol"], "BINANCE:BTCUSDT")
+                    self.assertEqual(len(call_kwargs["json"]["studies"]), 3)
         _run(go())
 
     def test_generate_mplfinance_image(self):
@@ -1255,6 +1256,127 @@ class TestUIRedesign(unittest.TestCase):
 
                 coin_text, coin_markup = await _render_wiz_coin("BTC", mock_engine)
                 self.assertIn("Set Alert for BTC", coin_text)
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+
+class TestAuditRemediations(unittest.TestCase):
+    def test_iso_in_seconds(self):
+        import database as db
+        import datetime
+        now = datetime.datetime.now(datetime.timezone.utc)
+        result = db.iso_in(seconds=120)
+        parsed = datetime.datetime.strptime(result, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+        diff = (parsed - now).total_seconds()
+        self.assertTrue(115 <= diff <= 125)
+
+    def test_should_keep_subscribed(self):
+        async def go():
+            import database as db
+            import config
+            from telegram_bot import _should_keep_subscribed
+            from unittest.mock import patch
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                with patch.object(config, "WATCHLIST_SYMBOLS", ()):
+                    # Symbol with alert
+                    aid = await db.add_alert("BTCUSDT", 70000, "above")
+                    self.assertTrue(await _should_keep_subscribed("BTCUSDT"))
+
+                    # Symbol without alert, not watched
+                    self.assertFalse(await _should_keep_subscribed("ETHUSDT"))
+
+                    # Now watch ETHUSDT
+                    await db.add_watch("ETHUSDT")
+                    self.assertTrue(await _should_keep_subscribed("ETHUSDT"))
+
+                    # Remove alert for BTCUSDT, should now be False (not watched)
+                    await db.remove_alert(aid)
+                    self.assertFalse(await _should_keep_subscribed("BTCUSDT"))
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_alert_editor_alert_type_separation(self):
+        async def go():
+            import database as db
+            from telegram_bot import _render_alert_editor
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                # 1. Price alert
+                aid_price = await db.add_alert("BTCUSDT", 70000, "above", alert_type="price")
+                res_price = await _render_alert_editor(aid_price)
+                self.assertIsNotNone(res_price)
+                txt_p, kb_p = res_price
+                cb_data_p = [btn.callback_data for row in kb_p.inline_keyboard for btn in row]
+                self.assertIn(f"edittgt_{aid_price}_1", cb_data_p)
+                self.assertIn(f"edit_flip_{aid_price}", cb_data_p)
+                self.assertIn(f"edit_custom_{aid_price}", cb_data_p)
+
+                # 2. Trailing stop alert
+                aid_trail = await db.add_alert("ETHUSDT", 3000, "below", alert_type="trail", pct=5.0)
+                res_trail = await _render_alert_editor(aid_trail)
+                self.assertIsNotNone(res_trail)
+                txt_t, kb_t = res_trail
+                self.assertIn("Trailing Stop", txt_t)
+                cb_data_t = [btn.callback_data for row in kb_t.inline_keyboard for btn in row]
+                self.assertNotIn(f"edittgt_{aid_trail}_1", cb_data_t)
+                self.assertNotIn(f"edit_flip_{aid_trail}", cb_data_t)
+                self.assertNotIn(f"edit_custom_{aid_trail}", cb_data_t)
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
+    def test_tools_deck_callback_handling(self):
+        async def go():
+            import database as db
+            from telegram_bot import cmd_history, cmd_health
+            from unittest.mock import AsyncMock, MagicMock, patch
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+                # Mock update representing a callback query: update.message is None!
+                mock_update = MagicMock()
+                mock_update.message = None
+                mock_update.effective_user.id = 123
+                mock_cb_msg = MagicMock()
+                mock_cb_msg.reply_text = AsyncMock()
+                mock_update.callback_query.message = mock_cb_msg
+
+                mock_context = MagicMock()
+                mock_context.args = []
+                mock_context.bot_data = {
+                    "engine": MagicMock(get_stats=MagicMock(return_value={}), last_update_at={}),
+                    "ws": MagicMock(connected=True, reconnects=0, subscribed_symbols=set())
+                }
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    # cmd_history with update.message=None should not crash
+                    await cmd_history(mock_update, mock_context)
+                    self.assertTrue(mock_cb_msg.reply_text.called)
+
+                    # cmd_health with update.message=None should not crash
+                    mock_cb_msg.reply_text.reset_mock()
+                    await cmd_health(mock_update, mock_context)
+                    self.assertTrue(mock_cb_msg.reply_text.called)
             finally:
                 await db.close_db()
                 db.DB_PATH, db._db = old_path, old_conn

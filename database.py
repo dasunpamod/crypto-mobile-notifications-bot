@@ -439,9 +439,9 @@ def utcnow_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def iso_in(days=0, hours=0, minutes=0) -> str:
+def iso_in(days=0, hours=0, minutes=0, seconds=0) -> str:
     dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-        days=days, hours=hours, minutes=minutes
+        days=days, hours=hours, minutes=minutes, seconds=seconds
     )
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 

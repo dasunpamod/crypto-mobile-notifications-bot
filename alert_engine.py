@@ -337,11 +337,16 @@ class AlertEngine:
                 if triggered_any and self.binance_ws:
                     try:
                         remaining = await db.get_alerts_for_symbol(symbol)
-                        if not remaining:
+                        is_watched = False
+                        try:
+                            is_watched = await db.is_watched(symbol) or (symbol in (getattr(config, "WATCHLIST_SYMBOLS", None) or ()))
+                        except Exception:
+                            pass
+                        if not remaining and not is_watched:
                             await self.binance_ws.unsubscribe(symbol)
                             self.last_prices.pop(symbol, None)
                             self.last_update_at.pop(symbol, None)
-                            logger.info(f"No remaining alerts for {symbol} — unsubscribed")
+                            logger.info(f"No remaining alerts or watchlist for {symbol} — unsubscribed")
                     except Exception as e:
                         logger.error(f"Error unsubscribing {symbol}: {e}")
         except Exception as e:

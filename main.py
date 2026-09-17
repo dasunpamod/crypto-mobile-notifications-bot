@@ -7,7 +7,7 @@ import signal
 
 import config
 from config import TELEGRAM_BOT_TOKEN, validate_config
-from database import close_db, get_active_symbols, init_db
+from database import close_db, get_active_symbols, get_watchlist, init_db
 from binance_ws import BybitWebSocket
 from alert_engine import AlertEngine
 from telegram_bot import create_bot, format_price
@@ -190,7 +190,11 @@ async def main() -> None:
 
     # ── Load existing alerts + watchlist and subscribe to their symbols ──
     alert_symbols = await get_active_symbols()
-    watchlist_symbols = config.WATCHLIST_SYMBOLS or ("BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT")
+    watchlist_symbols = list(config.WATCHLIST_SYMBOLS or ("BTCUSDT", "ETHUSDT", "SOLUSDT", "HYPEUSDT"))
+    try:
+        watchlist_symbols.extend(await get_watchlist())
+    except Exception:
+        pass
     all_symbols = sorted(set(alert_symbols) | set(watchlist_symbols))
     for symbol in all_symbols:
         await ws.subscribe(symbol)

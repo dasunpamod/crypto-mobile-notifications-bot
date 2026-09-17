@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code (explicit list keeps secrets/DB out of the image)
-COPY config.py database.py alert_engine.py binance_ws.py notifier.py prices.py telegram_bot.py main.py ./
+COPY config.py database.py alert_engine.py binance_ws.py notifier.py prices.py telegram_bot.py charts.py webhook_server.py main.py ./
 
 # Run the alert system
 CMD ["python", "main.py"]

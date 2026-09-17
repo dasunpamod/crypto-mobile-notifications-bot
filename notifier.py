@@ -250,7 +250,16 @@ async def send_alert_notification(
                 reply_markup=reply_markup,
             )
         except Exception as e:
-            logger.error(f"Failed to send Telegram alert: {e}")
+            logger.warning(f"Telegram Markdown send failed ({e}); retrying with plain text")
+            try:
+                plain = telegram_text.replace("*", "").replace("`", "")
+                await telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text=plain,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e2:
+                logger.error(f"Failed to send Telegram alert: {e2}")
     elif not ntfy_ok and telegram_bot and chat_id:
         # Fallback: ntfy failed/misconfigured — still deliver via Telegram
         # so alerts are never silently dropped.
@@ -262,5 +271,14 @@ async def send_alert_notification(
                 reply_markup=reply_markup,
             )
         except Exception as e:
-            logger.error(f"Failed to send Telegram fallback alert: {e}")
+            logger.warning(f"Telegram fallback Markdown send failed ({e}); retrying with plain text")
+            try:
+                plain = telegram_text.replace("*", "").replace("`", "")
+                await telegram_bot.send_message(
+                    chat_id=chat_id,
+                    text=plain,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e2:
+                logger.error(f"Failed to send Telegram fallback alert: {e2}")
 
