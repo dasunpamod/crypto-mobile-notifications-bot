@@ -2347,23 +2347,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not query:
         return
 
-    _orig_answer = query.answer
-    _query_answered = False
+    # Track whether query.answer() has been called to prevent double-answering.
+    # Use a list so _dispatch_callback can mutate it (avoids monkey-patching
+    # the frozen CallbackQuery object which newer python-telegram-bot forbids).
+    answered = [False]
 
-    async def _wrapped_answer(*args, **kwargs):
-        nonlocal _query_answered
-        if _query_answered:
+    async def _safe_answer(*args, **kwargs):
+        """Call query.answer() at most once, swallowing errors."""
+        if answered[0]:
             return
-        _query_answered = True
+        answered[0] = True
         try:
-            return await _orig_answer(*args, **kwargs)
+            await query.answer(*args, **kwargs)
         except Exception:
             pass
 
-    query.answer = _wrapped_answer
-
     try:
-        await _dispatch_callback(query, update, context)
+        await _dispatch_callback(query, update, context, _safe_answer)
     except Exception as e:
         logger.error(f"Callback dispatch error for data={query.data!r}: {e}", exc_info=True)
         try:
@@ -2375,100 +2375,104 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception:
             pass
     finally:
-        if not _query_answered:
+        if not answered[0]:
             try:
-                await _orig_answer()
+                await query.answer()
             except Exception:
                 pass
-        query.answer = _orig_answer
 
 
-async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              answer=None) -> None:
     data = query.data or ""
     engine = context.bot_data["engine"]
 
+    # Fallback: if no safe answer callback provided, use query.answer directly
+    if answer is None:
+        answer = query.answer
+
     if data == "hub_main":
-        await query.answer()
+        await answer()
         txt, kb = await _render_dashboard(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_refresh":
-        await query.answer("⚡ Dashboard updated!")
+        await answer("⚡ Dashboard updated!")
         txt, kb = await _render_dashboard(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_alerts":
-        await query.answer()
+        await answer()
         txt, kb = await get_list_text_and_markup(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_movers":
-        await query.answer()
+        await answer()
         txt, kb = await _render_movers_deck()
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_watch":
-        await query.answer()
+        await answer()
         txt, kb = await _render_watch_deck(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_pause":
-        await query.answer()
+        await answer()
         txt, kb = await _render_pause_deck(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_tools":
-        await query.answer()
+        await answer()
         ws = context.bot_data.get("ws")
         txt, kb = await _render_tools_deck(engine, ws)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_charts":
-        await query.answer()
+        await answer()
         txt, kb = await _render_charts_hub()
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_grid":
-        await query.answer()
+        await answer()
         txt, kb = await _render_wiz_start()
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "hub_history":
-        await query.answer()
+        await answer()
         await cmd_history(update, context)
         return
 
     if data == "hub_health":
-        await query.answer()
+        await answer()
         await cmd_health(update, context)
         return
 
     if data == "hub_backup":
-        await query.answer()
+        await answer()
         await cmd_backup(update, context)
         return
 
     if data == "hub_export":
-        await query.answer()
+        await answer()
         await cmd_export(update, context)
         return
 
     if data == "hub_update":
-        await query.answer()
+        await answer()
         await cmd_update(update, context)
         return
 
     if data.startswith("coin_card_"):
-        await query.answer()
+        await answer()
         coin = data[len("coin_card_"):]
         await _show_coin_card(query, coin, engine)
         return
@@ -2480,12 +2484,12 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         ws = context.bot_data.get("ws")
         if ws and is_now:
             await ws.subscribe(sym)
-        await query.answer(f"{'Added to' if is_now else 'Removed from'} watchlist!")
+        await answer(f"{'Added to' if is_now else 'Removed from'} watchlist!")
         await _show_coin_card(query, coin, engine)
         return
 
     if data == "watch_add_wiz":
-        await query.answer()
+        await answer()
         context.user_data["awaiting_watch_coin"] = True
         kb = [
             [InlineKeyboardButton("+DOGE", callback_data="watch_add_quick_DOGE"), InlineKeyboardButton("+XRP", callback_data="watch_add_quick_XRP")],
@@ -2507,13 +2511,13 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         ws = context.bot_data.get("ws")
         if ws:
             await ws.subscribe(sym)
-        await query.answer(f"Added {coin} to watchlist!")
+        await answer(f"Added {coin} to watchlist!")
         txt, kb = await _render_watch_deck(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "watch_del_wiz":
-        await query.answer()
+        await answer()
         watch = await _effective_watchlist()
         kb = [[InlineKeyboardButton(f"❌ Remove {s.replace('USDT', '')}", callback_data=f"watch_remove_{s.replace('USDT', '')}")] for s in watch]
         kb.append([InlineKeyboardButton("🔙 Back to Watchlist", callback_data="hub_watch")])
@@ -2528,7 +2532,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         coin = data[len("watch_remove_"):]
         sym = normalize_symbol(coin)
         await db.remove_watch(sym)
-        await query.answer(f"Removed {coin} from watchlist.")
+        await answer(f"Removed {coin} from watchlist.")
         txt, kb = await _render_watch_deck(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
@@ -2537,47 +2541,47 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         dur = data[len("pause_dur_"):]
         secs = _parse_duration(dur) or 3600
         engine.pause_alerts(secs / 3600)
-        await query.answer(f"Alerts paused for {dur}!")
+        await answer(f"Alerts paused for {dur}!")
         txt, kb = await _render_pause_deck(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "pause_resume":
         engine.resume_alerts()
-        await query.answer("Alerts resumed! 🔔")
+        await answer("Alerts resumed! 🔔")
         txt, kb = await _render_dashboard(engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data == "wiz_start":
-        await query.answer()
+        await answer()
         txt, kb = await _render_wiz_start()
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_coin_"):
-        await query.answer()
+        await answer()
         coin = data[len("wiz_coin_"):]
         txt, kb = await _render_wiz_coin(coin, engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_trail_"):
-        await query.answer()
+        await answer()
         coin = data[len("wiz_trail_"):]
         txt, kb = await _render_wiz_trail(coin, engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_move_"):
-        await query.answer()
+        await answer()
         coin = data[len("wiz_move_"):]
         txt, kb = await _render_wiz_move(coin, engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
         return
 
     if data.startswith("wiz_grid_"):
-        await query.answer()
+        await answer()
         coin = data[len("wiz_grid_"):]
         txt, kb = await _render_wiz_grid(coin, engine)
         await _safe_edit_md(query, txt, reply_markup=kb)
@@ -2585,7 +2589,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
 
     if data.startswith("wiz_add_pct_"):
         if await db.count_alerts() >= _max_alerts():
-            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            await answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
             return
         parts = data.split("_")
         coin = parts[3].upper()
@@ -2593,7 +2597,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         sym = normalize_symbol(coin)
         price = await get_fast_or_live_price(sym, engine)
         if not price:
-            await query.answer("Could not get current price.", show_alert=True)
+            await answer("Could not get current price.", show_alert=True)
             return
         cond = "above" if pct > 0 else "below"
         tgt = price * (1 + pct / 100)
@@ -2601,7 +2605,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         ws = context.bot_data.get("ws")
         if ws:
             await ws.subscribe(sym)
-        await query.answer(f"✅ Alert #{aid} created!")
+        await answer(f"✅ Alert #{aid} created!")
         kb = [
             [InlineKeyboardButton("➕ Set Another Alert", callback_data="wiz_start"),
              InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts")],
@@ -2619,7 +2623,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
 
     if data.startswith("wiz_add_trail_"):
         if await db.count_alerts() >= _max_alerts():
-            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            await answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
             return
         parts = data.split("_")
         coin = parts[3].upper()
@@ -2627,13 +2631,13 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         sym = normalize_symbol(coin)
         price = await get_fast_or_live_price(sym, engine)
         if not price:
-            await query.answer("Could not get current price.", show_alert=True)
+            await answer("Could not get current price.", show_alert=True)
             return
         aid = await db.add_alert(sym, price, "below", True, alert_type="trail", pct=pct, base_price=price, peak_price=price)
         ws = context.bot_data.get("ws")
         if ws:
             await ws.subscribe(sym)
-        await query.answer(f"✅ Trailing Stop #{aid} created!")
+        await answer(f"✅ Trailing Stop #{aid} created!")
         kb = [
             [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
              InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
@@ -2649,7 +2653,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
 
     if data.startswith("wiz_add_move_"):
         if await db.count_alerts() >= _max_alerts():
-            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            await answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
             return
         parts = data.split("_")
         coin = parts[3].upper()
@@ -2658,13 +2662,13 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         sym = normalize_symbol(coin)
         price = await get_fast_or_live_price(sym, engine)
         if not price:
-            await query.answer("Could not get current price.", show_alert=True)
+            await answer("Could not get current price.", show_alert=True)
             return
         aid = await db.add_alert(sym, price, "above", True, alert_type="move", pct=pct, window_min=win, base_price=price, peak_price=price)
         ws = context.bot_data.get("ws")
         if ws:
             await ws.subscribe(sym)
-        await query.answer(f"✅ Move Alert #{aid} created!")
+        await answer(f"✅ Move Alert #{aid} created!")
         kb = [
             [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
              InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
@@ -2684,12 +2688,12 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         spread = float(parts[3])
         levels = int(parts[4])
         if await db.count_alerts() + levels > _max_alerts():
-            await query.answer(f"Not enough room (limit {_max_alerts()}).", show_alert=True)
+            await answer(f"Not enough room (limit {_max_alerts()}).", show_alert=True)
             return
         sym = normalize_symbol(coin)
         price = await get_fast_or_live_price(sym, engine)
         if not price:
-            await query.answer("Could not get current price.", show_alert=True)
+            await answer("Could not get current price.", show_alert=True)
             return
         low = price * (1 - spread / 100)
         high = price * (1 + spread / 100)
@@ -2705,7 +2709,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             added_ids.append(aid)
         if ws:
             await ws.subscribe(sym)
-        await query.answer(f"✅ Grid deployed with {len(added_ids)} alerts!")
+        await answer(f"✅ Grid deployed with {len(added_ids)} alerts!")
         kb = [
             [InlineKeyboardButton("📋 View Alerts", callback_data="hub_alerts"),
              InlineKeyboardButton("⚡ Dashboard", callback_data="hub_main")],
@@ -2726,7 +2730,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
 
     if data.startswith("quick_add_"):
         if await db.count_alerts() >= _max_alerts():
-            await query.answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
+            await answer(f"Alert limit reached ({_max_alerts()}).", show_alert=True)
             return
         # quick_add_<symbol>_<condition>_<target>
         parts = data.split("_")
@@ -2738,13 +2742,13 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 ws = context.bot_data["ws"]
                 await ws.subscribe(sym)
                 coin = _escape_md(sym.replace("USDT", ""))
-                await query.answer(f"✅ Added alert #{aid}: {coin} {cond} {format_price(tgt)}")
+                await answer(f"✅ Added alert #{aid}: {coin} {cond} {format_price(tgt)}")
                 try:
                     await query.edit_message_reply_markup(reply_markup=None)
                 except Exception:
                     pass
             except Exception as e:
-                await query.answer(f"Error: {e}")
+                await answer(f"Error: {e}")
         return
 
     if data.startswith("quick_snooze_"):
@@ -2757,13 +2761,13 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 dur = _parse_duration(dur_str) or 7200
                 until = db.iso_in(seconds=dur)
                 await db.set_snooze(aid, until)
-                await query.answer(f"🔕 Alert #{aid} snoozed for {dur_str}")
+                await answer(f"🔕 Alert #{aid} snoozed for {dur_str}")
                 try:
                     await query.edit_message_reply_markup(reply_markup=None)
                 except Exception:
                     pass
             except Exception as e:
-                await query.answer(f"Error: {e}")
+                await answer(f"Error: {e}")
         return
 
     if data.startswith("quick_del_"):
@@ -2779,15 +2783,15 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                     if not await _should_keep_subscribed(sym):
                         ws = context.bot_data["ws"]
                         await ws.unsubscribe(sym)
-                    await query.answer(f"❌ Alert #{aid} removed")
+                    await answer(f"❌ Alert #{aid} removed")
                 else:
-                    await query.answer(f"Alert #{aid} already removed")
+                    await answer(f"Alert #{aid} already removed")
                 try:
                     await query.edit_message_reply_markup(reply_markup=None)
                 except Exception:
                     pass
             except Exception as e:
-                await query.answer(f"Error: {e}")
+                await answer(f"Error: {e}")
         return
 
     if data.startswith("chart_"):
@@ -2804,7 +2808,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             if chart_type not in valid_types:
                 chart_type = "tv"
 
-            await query.answer("Updating chart...")
+            await answer("Updating chart...")
             chart_png = await charts.generate_chart_image(sym, interval=interval, chart_type=chart_type)
             if chart_png:
                 caption, markup = _build_chart_ui(sym, interval, chart_type)
@@ -2831,11 +2835,11 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 except Exception as e:
                     logger.error(f"Error sending chart via callback: {e}")
             else:
-                await query.answer(f"Failed to generate chart for {sym}.", show_alert=True)
+                await answer(f"Failed to generate chart for {sym}.", show_alert=True)
         return
 
     if data.startswith("list_"):
-        await query.answer()
+        await answer()
         try:
             rest = data[len("list_"):]
             page_s, _, filt = rest.partition("|")
@@ -2847,7 +2851,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         return
 
     if data.startswith("refresh_list"):
-        await query.answer("List refreshed!")
+        await answer("List refreshed!")
         rest = data[len("refresh_list"):].lstrip("_")
         page_s, _, filt = rest.partition("|")
         try:
@@ -2864,11 +2868,11 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             alert_id = int(data.split("_")[2])
             alert = await db.get_alert(alert_id)
             if not alert:
-                await query.answer("Alert not found.", show_alert=True)
+                await answer("Alert not found.", show_alert=True)
                 return
             atype = db.alert_field(alert, "alert_type", "price") or "price"
             if atype != "price":
-                await query.answer("Custom price is only supported for price alerts.", show_alert=True)
+                await answer("Custom price is only supported for price alerts.", show_alert=True)
                 return
             context.user_data["editing_alert_target"] = alert_id
             await _safe_edit_md(
@@ -2877,7 +2881,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 f"Please reply with the new target price in chat (e.g. `74500` or `152.5`):",
             )
         except Exception as e:
-            await query.answer(f"Error: {e}")
+            await answer(f"Error: {e}")
         return
 
     if data.startswith("edittgt_"):
@@ -2890,18 +2894,18 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 if alert:
                     atype = db.alert_field(alert, "alert_type", "price") or "price"
                     if atype != "price":
-                        await query.answer("Target adjustment is only supported for price alerts.", show_alert=True)
+                        await answer("Target adjustment is only supported for price alerts.", show_alert=True)
                         return
                     cur_tgt = db.alert_field(alert, "target", 0)
                     cond = db.alert_field(alert, "condition", "above")
                     new_tgt = cur_tgt * (1 + delta / 100)
                     await db.set_target(aid, new_tgt, cond)
-                    await query.answer(f"Target set to {format_price(new_tgt)} ({delta:+.0f}%)")
+                    await answer(f"Target set to {format_price(new_tgt)} ({delta:+.0f}%)")
                     res = await _render_alert_editor(aid)
                     if res:
                         await _safe_edit_md(query, res[0], reply_markup=res[1])
             except Exception as e:
-                await query.answer(f"Error: {e}")
+                await answer(f"Error: {e}")
         return
 
     if data.startswith("edit_flip_"):
@@ -2911,30 +2915,30 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             if alert:
                 atype = db.alert_field(alert, "alert_type", "price") or "price"
                 if atype != "price":
-                    await query.answer("Condition flip is only supported for price alerts.", show_alert=True)
+                    await answer("Condition flip is only supported for price alerts.", show_alert=True)
                     return
                 cur_tgt = db.alert_field(alert, "target", 0)
                 cond = db.alert_field(alert, "condition", "above")
                 new_cond = "below" if cond == "above" else "above"
                 await db.set_target(aid, cur_tgt, new_cond)
-                await query.answer(f"Condition flipped to {new_cond.upper()}!")
+                await answer(f"Condition flipped to {new_cond.upper()}!")
                 res = await _render_alert_editor(aid)
                 if res:
                     await _safe_edit_md(query, res[0], reply_markup=res[1])
         except Exception as e:
-            await query.answer(f"Error: {e}")
+            await answer(f"Error: {e}")
         return
 
     if data.startswith("toggle_repeat_"):
         try:
             aid = int(data.split("_")[2])
             new_val = await db.toggle_persistent(aid)
-            await query.answer(f"Repeat {'ENABLED' if new_val else 'DISABLED'}")
+            await answer(f"Repeat {'ENABLED' if new_val else 'DISABLED'}")
             res = await _render_alert_editor(aid)
             if res:
                 await _safe_edit_md(query, res[0], reply_markup=res[1])
         except Exception as e:
-            await query.answer(f"Error: {e}")
+            await answer(f"Error: {e}")
         return
 
     if data.startswith("toggle_urgent_"):
@@ -2942,15 +2946,15 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             alert_id = int(data.split("_")[2])
             new_state = await db.toggle_urgent(alert_id)
             if new_state is None:
-                await query.answer("Alert not found.", show_alert=True)
+                await answer("Alert not found.", show_alert=True)
                 return
             status_str = "🚨 Emergency Siren ENABLED" if new_state else "🔕 Siren DISABLED"
-            await query.answer(status_str)
+            await answer(status_str)
             res = await _render_alert_editor(alert_id)
             if res:
                 await _safe_edit_md(query, res[0], reply_markup=res[1])
         except Exception as e:
-            await query.answer(f"Error: {e}")
+            await answer(f"Error: {e}")
         return
 
     if data.startswith("snooze_"):
@@ -2961,7 +2965,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
                 hours = int(parts[2].rstrip("h"))
                 until = db.iso_in(hours=hours)
                 await db.set_snooze(alert_id, until)
-                await query.answer(f"🔕 Snoozed for {hours}h!")
+                await answer(f"🔕 Snoozed for {hours}h!")
                 res = await _render_alert_editor(alert_id)
                 if res:
                     await _safe_edit_md(query, res[0], reply_markup=res[1])
@@ -2974,7 +2978,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             alert_id = int(data.split("_")[1])
         except (ValueError, IndexError):
             return
-        await query.answer()
+        await answer()
         res = await _render_alert_editor(alert_id)
         if not res:
             await _safe_edit_md(query, f"Alert #{alert_id} not found.", reply_markup=None)
