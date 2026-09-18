@@ -267,6 +267,25 @@ async def toggle_persistent(alert_id: int) -> bool | None:
     return bool(new_val)
 
 
+async def set_all_persistent(is_persistent: bool, symbol: str | None = None) -> int:
+    """Set is_persistent for all price alerts, optionally filtered by symbol. Returns count of updated alerts."""
+    db = await get_db()
+    if symbol:
+        cursor = await db.execute(
+            "UPDATE alerts SET is_persistent = ? WHERE symbol = ? AND alert_type = 'price'",
+            (1 if is_persistent else 0, symbol),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE alerts SET is_persistent = ? WHERE alert_type = 'price'",
+            (1 if is_persistent else 0,),
+        )
+    await db.commit()
+    count = cursor.rowcount
+    await cursor.close()
+    return count
+
+
 async def set_urgent(alert_id: int, is_urgent: bool) -> bool:
     """Set is_urgent flag for an alert. Returns True if alert was found and updated."""
     db = await get_db()

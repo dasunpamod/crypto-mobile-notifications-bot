@@ -1454,6 +1454,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/status` — health, `/health` — watchdog\n\n"
         "*Manage:*\n"
         "`/remove 3`, `/removeall` (asks first)\n"
+        "`/once [coin]`, `/repeat [coin]` — switch between one-time and repeat\n"
         "`/pause [15m|2h]`, `/resume`\n"
         "`/watch BTC ETH` / `/unwatch BTC` / `/watchlist`\n"
         "`/export` backup file, `/import` restore (reply to file)\n"
@@ -2143,6 +2144,48 @@ async def cmd_grid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+@authorized
+async def cmd_once(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/once [coin|all] — convert active alerts to one-time (once) alerts."""
+    args = context.args or []
+    if args and args[0].lower() not in ("all", "*"):
+        coin = args[0].upper().replace("USDT", "")
+        sym = normalize_symbol(coin)
+        count = await db.set_all_persistent(False, symbol=sym)
+        await update.message.reply_text(
+            f"🎯 Converted {count} active alert(s) for {coin_icon(coin)} *{coin}* to **one-time** (once).\n"
+            f"They will fire once when triggered and then complete.",
+            parse_mode="Markdown"
+        )
+    else:
+        count = await db.set_all_persistent(False)
+        await update.message.reply_text(
+            f"🎯 Converted all {count} active price alert(s) to **one-time** (once).\n"
+            f"They will fire once when triggered and then complete.",
+            parse_mode="Markdown"
+        )
+
+
+@authorized
+async def cmd_repeat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/repeat [coin|all] — convert active alerts to repeating alerts."""
+    args = context.args or []
+    if args and args[0].lower() not in ("all", "*"):
+        coin = args[0].upper().replace("USDT", "")
+        sym = normalize_symbol(coin)
+        count = await db.set_all_persistent(True, symbol=sym)
+        await update.message.reply_text(
+            f"🔁 Converted {count} active alert(s) for {coin_icon(coin)} *{coin}* to **repeat**.",
+            parse_mode="Markdown"
+        )
+    else:
+        count = await db.set_all_persistent(True)
+        await update.message.reply_text(
+            f"🔁 Converted all {count} active price alert(s) to **repeat**.",
+            parse_mode="Markdown"
+        )
+
+
 _MENU_LABELS = (
     "Dashboard", "⚡ Dashboard", "My Alerts", "📋 My Alerts", "List Alerts",
     "Prices", "💰 Prices", "Check Price", "Add Alert", "➕ Set Alert", "Set Alert",
@@ -2757,7 +2800,7 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
             cond = "above" if p_tgt > price else "below"
             if abs(p_tgt - price) / price < 0.0001:
                 continue
-            aid = await db.add_alert(sym, p_tgt, cond, True, alert_type="price")
+            aid = await db.add_alert(sym, p_tgt, cond, False, alert_type="price")
             added_ids.append(aid)
         if ws:
             await ws.subscribe(sym)
@@ -2768,8 +2811,9 @@ async def _dispatch_callback(query, update: Update, context: ContextTypes.DEFAUL
         ]
         await _safe_edit_md(
             query,
-            f"🌐 *Grid deployed for {_escape_md(coin)}!*\n\n"
-            f"• Deployed {len(added_ids)} alerts between *{format_price(low)}* and *{format_price(high)}*\n"
+            f"🌐 *Grid deployed for {coin_icon(coin)} {_escape_md(coin)}!*\n\n"
+            f"• Deployed {len(added_ids)} one-time alerts between *{format_price(low)}* and *{format_price(high)}*\n"
+            f"• Mode: 🎯 One-Time (fires once and completes)\n"
             f"• Spread: ±{spread:g}%\n"
             f"• Current Price: {format_price(price)}",
             reply_markup=InlineKeyboardMarkup(kb),
@@ -3224,6 +3268,8 @@ async def _post_init(application: Application) -> None:
         BotCommand("status", "System & alert engine status"),
         BotCommand("health", "Diagnostics & watchdog health"),
         BotCommand("grid", "Create automated price alert grid"),
+        BotCommand("once", "Convert active alerts to one-time (once) mode"),
+        BotCommand("repeat", "Convert active alerts to repeat mode"),
         BotCommand("update", "Pull updates & restart bot (owner only)"),
         BotCommand("export", "Export alerts as JSON backup"),
         BotCommand("import", "Import alerts from JSON backup"),
@@ -3254,6 +3300,8 @@ def create_bot(alert_engine, binance_ws) -> Application:
     app.add_handler(CommandHandler("urgent", cmd_urgent))
     app.add_handler(CommandHandler("siren", cmd_urgent))
     app.add_handler(CommandHandler("grid", cmd_grid))
+    app.add_handler(CommandHandler("once", cmd_once))
+    app.add_handler(CommandHandler("repeat", cmd_repeat))
     app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("removeall", cmd_removeall))

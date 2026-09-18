@@ -1473,6 +1473,68 @@ class TestAuditRemediations(unittest.TestCase):
         self.assertEqual(p, 99.45)
         engine.get_fresh_price.assert_called_with("SOLUSDT", max_age_sec=60)
 
+    def test_grid_alerts_are_one_time_and_cmd_once(self):
+        async def go():
+            import database as db
+            import telegram_bot
+            from unittest.mock import AsyncMock, MagicMock, patch
+            tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tmp.close()
+            old_path, old_conn = db.DB_PATH, db._db
+            db.DB_PATH, db._db = tmp.name, None
+            try:
+                await db.init_db()
+
+                # 1. Deploy grid via callback
+                mock_engine = MagicMock()
+                mock_engine.get_fresh_price.return_value = 70000.0
+                mock_context = MagicMock()
+                mock_context.bot_data = {"engine": mock_engine, "ws": AsyncMock()}
+                mock_context.user_data = {}
+                mock_context.args = []
+
+                mock_query = AsyncMock()
+                mock_query.data = "grid_preset_BTC_5_5"
+                mock_update = MagicMock()
+                mock_update.callback_query = mock_query
+                mock_update.effective_user.id = 123
+
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123), \
+                     patch("telegram_bot.get_fast_or_live_price", new_callable=AsyncMock) as mock_p:
+                    mock_p.return_value = 70000.0
+                    await telegram_bot.handle_callback(mock_update, mock_context)
+
+                alerts = await db.get_all_alerts()
+                self.assertGreater(len(alerts), 0)
+                # Verify ALL deployed grid alerts have is_persistent == 0 (one-time)
+                for a in alerts:
+                    self.assertEqual(db.alert_field(a, "is_persistent"), 0, "Grid alert should be one-time (once)!")
+
+                # 2. Test cmd_repeat to turn them into repeat
+                mock_msg = AsyncMock()
+                mock_up2 = MagicMock()
+                mock_up2.message = mock_msg
+                mock_up2.effective_user.id = 123
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    await telegram_bot.cmd_repeat(mock_up2, mock_context)
+
+                alerts2 = await db.get_all_alerts()
+                for a in alerts2:
+                    self.assertEqual(db.alert_field(a, "is_persistent"), 1)
+
+                # 3. Test cmd_once to convert them back to once
+                with patch("telegram_bot.config.TELEGRAM_USER_ID", 123):
+                    await telegram_bot.cmd_once(mock_up2, mock_context)
+
+                alerts3 = await db.get_all_alerts()
+                for a in alerts3:
+                    self.assertEqual(db.alert_field(a, "is_persistent"), 0)
+            finally:
+                await db.close_db()
+                db.DB_PATH, db._db = old_path, old_conn
+                os.unlink(tmp.name)
+        _run(go())
+
 
 if __name__ == "__main__":
     unittest.main()
